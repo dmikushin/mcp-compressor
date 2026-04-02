@@ -245,14 +245,19 @@ class CompressedTools(CatalogTransform):
                 return await self.invoke_tool(tool_name, tool_input, quiet, active_ctx)
         tool = await self._get_backend_tool(ctx, tool_name)
         if tool_input:
+            tool_input = self._autocorrect_param_names(tool, tool_input)
             tool_input = self._autocorrect_enum_values(tool, tool_input)
         try:
             tool_result = await tool.run(tool_input or {})
         except ValidationError as exc:
-            raise ToolError(await self._format_validation_error(ctx, tool_name, str(exc))) from exc
+            raise ToolError(
+                await self._format_validation_error(ctx, tool, tool_input, str(exc))
+            ) from exc
         except ToolError as exc:
             if self._is_validation_error_message(str(exc)):
-                raise ToolError(await self._format_validation_error(ctx, tool_name, str(exc))) from exc
+                raise ToolError(
+                    await self._format_validation_error(ctx, tool, tool_input, str(exc))
+                ) from exc
             raise
         if self._toonify:
             tool_result = self._toonify_tool_result(tool_result)
@@ -364,13 +369,33 @@ class CompressedTools(CatalogTransform):
             raise ToolNotFoundError(tool_name, available_tools)
         return tool
 
-    async def _format_validation_error(self, ctx: Context, tool_name: str, error_message: str) -> str:
-        """Format a validation failure with the tool schema for client guidance."""
+    async def _format_validation_error(
+        self, ctx: Context, tool: Tool | str, tool_input: dict[str, Any] | None, error_message: str
+    ) -> str:
+        """Format a validation failure with the tool schema and parameter suggestions."""
+        tool_name = tool.name if isinstance(tool, Tool) else tool
         tool_schema = await self.get_tool_schema(tool_name, ctx)
-        return (
-            f"Tool '{tool_name}' input validation failed: {error_message}\n\n"
-            f"Here is the result of get_tool_schema('{tool_name}'):\n{tool_schema}"
-        )
+        parts = [f"Tool '{tool_name}' input validation failed: {error_message}"]
+        if isinstance(tool, Tool) and tool_input:
+            suggestions = self._suggest_unknown_params(tool, tool_input)
+            if suggestions:
+                parts.append("Did you mean: " + ", ".join(f"'{k}' -> '{v}'" for k, v in suggestions.items()) + "?")
+        parts.append(f"Here is the result of get_tool_schema('{tool_name}'):\n{tool_schema}")
+        return "\n\n".join(parts)
+
+    def _suggest_unknown_params(self, tool: Tool, tool_input: dict[str, Any]) -> dict[str, str]:
+        """Return a mapping of unknown param names to their closest schema matches."""
+        properties = tool.parameters.get("properties", {})
+        if not properties:
+            return {}
+        known_names = list(properties)
+        suggestions: dict[str, str] = {}
+        for key in tool_input:
+            if key not in properties:
+                matches = difflib.get_close_matches(key, known_names, n=1, cutoff=0.4)
+                if matches:
+                    suggestions[key] = matches[0]
+        return suggestions
 
     def _make_help_tool(self, description: str | None = None) -> Tool:
         async def help_tool() -> str:
@@ -422,6 +447,29 @@ class CompressedTools(CatalogTransform):
             tool_description = tool_description.splitlines()[0].split(".")[0]
         tool_description = ": " + tool_description if tool_description else ""
         return f"<tool>{tool_name}({', '.join(tool_arg_names)}){tool_description}</tool>"
+
+    def _autocorrect_param_names(self, tool: Tool, tool_input: dict[str, Any]) -> dict[str, Any]:
+        """Auto-correct unknown parameter names by fuzzy matching against the tool schema.
+
+        When a parameter name doesn't exist in the schema (e.g. "pull_number" instead of
+        "pullNumber"), this method attempts to find a close match and renames the key.
+        If no close match is found, the unknown key is left as-is for downstream
+        validation to report.
+        """
+        properties = tool.parameters.get("properties", {})
+        if not properties:
+            return tool_input
+        known_names = set(properties)
+        unknown_keys = [k for k in tool_input if k not in known_names]
+        if not unknown_keys:
+            return tool_input
+        corrected = dict(tool_input)
+        for key in unknown_keys:
+            matches = difflib.get_close_matches(key, known_names, n=1, cutoff=0.6)
+            if matches and matches[0] not in corrected:
+                logger.debug(f"Auto-corrected parameter name '{key}' -> '{matches[0]}' for tool '{tool.name}'")
+                corrected[matches[0]] = corrected.pop(key)
+        return corrected
 
     def _autocorrect_enum_values(self, tool: Tool, tool_input: dict[str, Any]) -> dict[str, Any]:
         """Auto-correct enum parameter values by case-insensitive matching.

@@ -432,6 +432,89 @@ class TestAutocorrectEnumValues:
         assert result == {"method": "get"}
 
 
+class TestAutocorrectParamNames:
+    """Tests for parameter name auto-correction in invoke_tool."""
+
+    @pytest.fixture
+    def compressed_tools(self) -> CompressedTools:
+        return CompressedTools(None, CompressionLevel.LOW, server_name=None)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _make_tool_with_schema(parameters: dict) -> Tool:
+        def stub(x: str = "") -> str:
+            return "ok"
+
+        tool = Tool.from_function(stub, name="test_tool")
+        tool.parameters = parameters
+        return tool
+
+    def test_known_params_unchanged(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"pullNumber": {"type": "integer"}, "owner": {"type": "string"}},
+        })
+        result = compressed_tools._autocorrect_param_names(tool, {"pullNumber": 1, "owner": "x"})
+        assert result == {"pullNumber": 1, "owner": "x"}
+
+    def test_snake_to_camel_corrected(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"pullNumber": {"type": "integer"}, "owner": {"type": "string"}},
+        })
+        result = compressed_tools._autocorrect_param_names(tool, {"pull_number": 1, "owner": "x"})
+        assert result == {"pullNumber": 1, "owner": "x"}
+
+    def test_no_correction_when_no_close_match(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"pullNumber": {"type": "integer"}},
+        })
+        result = compressed_tools._autocorrect_param_names(tool, {"zzzzz": 1})
+        assert result == {"zzzzz": 1}
+
+    def test_no_overwrite_existing_param(self, compressed_tools: CompressedTools) -> None:
+        """Don't rename if the target name is already present in tool_input."""
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"pullNumber": {"type": "integer"}},
+        })
+        result = compressed_tools._autocorrect_param_names(tool, {"pull_number": 1, "pullNumber": 2})
+        assert result == {"pull_number": 1, "pullNumber": 2}
+
+
+class TestSuggestUnknownParams:
+    """Tests for parameter name suggestions in validation errors."""
+
+    @pytest.fixture
+    def compressed_tools(self) -> CompressedTools:
+        return CompressedTools(None, CompressionLevel.LOW, server_name=None)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _make_tool_with_schema(parameters: dict) -> Tool:
+        def stub(x: str = "") -> str:
+            return "ok"
+
+        tool = Tool.from_function(stub, name="test_tool")
+        tool.parameters = parameters
+        return tool
+
+    def test_suggests_close_match(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"pullNumber": {"type": "integer"}, "method": {"type": "string"}},
+        })
+        suggestions = compressed_tools._suggest_unknown_params(tool, {"pull_number": 1, "method": "get"})
+        assert suggestions == {"pull_number": "pullNumber"}
+
+    def test_no_suggestion_for_known_params(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {"method": {"type": "string"}},
+        })
+        suggestions = compressed_tools._suggest_unknown_params(tool, {"method": "get"})
+        assert suggestions == {}
+
+
 class TestToolNotFoundError:
     """Tests for ToolNotFoundError."""
 
