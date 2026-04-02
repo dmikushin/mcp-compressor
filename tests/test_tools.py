@@ -73,7 +73,7 @@ class TestCompressedTools:
             # MEDIUM takes only up to first period
             (CompressionLevel.MEDIUM, ": First sentence of description"),
             # HIGH removes description entirely
-            (CompressionLevel.HIGH, "dummy_fn(param1*, param2*)</tool>"),
+            (CompressionLevel.HIGH, "dummy_fn(param1 [REQUIRED], param2 [REQUIRED])</tool>"),
         ],
     )
     def test_compression_levels(
@@ -86,7 +86,7 @@ class TestCompressedTools:
         """Test that different compression levels produce appropriate output."""
         result = compressed_tools._format_tool_description(sample_tool, compression_level)
         assert expected_in_result in result
-        assert result.startswith("<tool>dummy_fn(param1*, param2*)")
+        assert result.startswith("<tool>dummy_fn(param1 [REQUIRED], param2 [REQUIRED])")
         assert result.endswith("</tool>")
 
     def test_tool_with_no_description(self, compressed_tools: CompressedTools) -> None:
@@ -98,7 +98,7 @@ class TestCompressedTools:
         tool = Tool.from_function(no_desc_tool)
         tool.description = None
         result = compressed_tools._format_tool_description(tool, CompressionLevel.LOW)
-        assert result == "<tool>no_desc_tool(arg*)</tool>"
+        assert result == "<tool>no_desc_tool(arg [REQUIRED])</tool>"
 
     def test_tool_with_no_parameters(self, compressed_tools: CompressedTools) -> None:
         """Test formatting a tool with no parameters."""

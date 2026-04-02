@@ -406,7 +406,7 @@ class CompressedTools(CatalogTransform):
             return f"<tool>{tool_name}</tool>"
         required_params = set(tool.parameters.get("required", []))
         tool_arg_names = [
-            f"{name}*" if name in required_params else name
+            f"{name} [REQUIRED]" if name in required_params else name
             for name in tool.parameters.get("properties", {})
         ]
         tool_description = (tool.description or "").strip()
