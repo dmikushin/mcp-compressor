@@ -459,7 +459,11 @@ class CompressedTools(CatalogTransform):
     def _is_validation_error_message(self, error_message: str) -> bool:
         """Return whether a tool error message appears to be an input validation failure."""
         lowered_message = error_message.lower()
-        return "validation error" in lowered_message or "missing required argument" in lowered_message
+        return (
+            "validation error" in lowered_message
+            or "missing required argument" in lowered_message
+            or "missing required parameter" in lowered_message
+        )
 
     def _toonify_tool_result(self, tool_result: ToolResult) -> ToolResult:
         """Convert JSON text content blocks in a tool result to TOON format."""
