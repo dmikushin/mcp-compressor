@@ -404,7 +404,11 @@ class CompressedTools(CatalogTransform):
         tool_name = tool.name
         if compression_level == CompressionLevel.MAX:
             return f"<tool>{tool_name}</tool>"
-        tool_arg_names = list(tool.parameters.get("properties", {}))
+        required_params = set(tool.parameters.get("required", []))
+        tool_arg_names = [
+            f"{name}*" if name in required_params else name
+            for name in tool.parameters.get("properties", {})
+        ]
         tool_description = (tool.description or "").strip()
         if compression_level == CompressionLevel.HIGH:
             tool_description = ""
