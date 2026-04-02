@@ -339,6 +339,99 @@ async def test_get_backend_tools_lazy_fetch_when_cache_cold() -> None:
     assert compressed_tools._cached_backend_tools is not None
 
 
+class TestAutocorrectEnumValues:
+    """Tests for enum auto-correction in invoke_tool."""
+
+    @pytest.fixture
+    def compressed_tools(self) -> CompressedTools:
+        return CompressedTools(None, CompressionLevel.LOW, server_name=None)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _make_tool_with_schema(parameters: dict) -> Tool:
+        """Create a Tool with a custom parameters schema."""
+
+        def stub(x: str = "") -> str:
+            return "ok"
+
+        tool = Tool.from_function(stub, name="test_tool")
+        tool.parameters = parameters
+        return tool
+
+    def _make_tool_with_enum(self, enum_values: list[str], prop_name: str = "method") -> Tool:
+        return self._make_tool_with_schema({
+            "type": "object",
+            "properties": {
+                prop_name: {"type": "string", "enum": enum_values},
+            },
+        })
+
+    def test_exact_match_unchanged(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff"])
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": "get"})
+        assert result == {"method": "get"}
+
+    def test_uppercase_corrected(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff", "get_status"])
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": "GET"})
+        assert result == {"method": "get"}
+
+    def test_mixed_case_corrected(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff", "get_status"])
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": "Get_Diff"})
+        assert result == {"method": "get_diff"}
+
+    def test_no_match_left_unchanged(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff"])
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": "nonexistent"})
+        assert result == {"method": "nonexistent"}
+
+    def test_non_string_values_skipped(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff"])
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": 42})
+        assert result == {"method": 42}
+
+    def test_non_enum_property_skipped(self, compressed_tools: CompressedTools) -> None:
+        def dummy(name: str) -> str:
+            return name
+
+        tool = Tool.from_function(dummy, name="test_tool")
+        result = compressed_tools._autocorrect_enum_values(tool, {"name": "HELLO"})
+        assert result == {"name": "HELLO"}
+
+    def test_anyof_enum_corrected(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {
+                "anchor": {
+                    "anyOf": [
+                        {"type": "number"},
+                        {"type": "string", "enum": ["newest", "oldest", "first_unread"]},
+                    ]
+                }
+            },
+        })
+        result = compressed_tools._autocorrect_enum_values(tool, {"anchor": "NEWEST"})
+        assert result == {"anchor": "newest"}
+
+    def test_multiple_params_corrected(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_schema({
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["get", "post"]},
+                "format": {"type": "string", "enum": ["json", "xml"]},
+            },
+        })
+        result = compressed_tools._autocorrect_enum_values(tool, {"method": "GET", "format": "JSON"})
+        assert result == {"method": "get", "format": "json"}
+
+    def test_original_input_not_mutated(self, compressed_tools: CompressedTools) -> None:
+        tool = self._make_tool_with_enum(["get", "get_diff"])
+        original = {"method": "GET"}
+        result = compressed_tools._autocorrect_enum_values(tool, original)
+        assert original == {"method": "GET"}
+        assert result == {"method": "get"}
+
+
 class TestToolNotFoundError:
     """Tests for ToolNotFoundError."""
 

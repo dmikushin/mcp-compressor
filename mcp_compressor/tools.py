@@ -238,6 +238,8 @@ class CompressedTools(CatalogTransform):
             async with Context(fastmcp=self._proxy_server) as active_ctx:
                 return await self.invoke_tool(tool_name, tool_input, quiet, active_ctx)
         tool = await self._get_backend_tool(ctx, tool_name)
+        if tool_input:
+            tool_input = self._autocorrect_enum_values(tool, tool_input)
         try:
             tool_result = await tool.run(tool_input or {})
         except ValidationError as exc:
@@ -410,6 +412,45 @@ class CompressedTools(CatalogTransform):
             tool_description = tool_description.splitlines()[0].split(".")[0]
         tool_description = ": " + tool_description if tool_description else ""
         return f"<tool>{tool_name}({', '.join(tool_arg_names)}){tool_description}</tool>"
+
+    def _autocorrect_enum_values(self, tool: Tool, tool_input: dict[str, Any]) -> dict[str, Any]:
+        """Auto-correct enum parameter values by case-insensitive matching.
+
+        When a tool schema defines enum constraints for string parameters,
+        this method fixes mismatched casing (e.g. "GET" -> "get") so that
+        minor LLM mistakes don't cause validation errors.
+        """
+        properties = tool.parameters.get("properties", {})
+        corrected = dict(tool_input)
+        for key, value in corrected.items():
+            if not isinstance(value, str):
+                continue
+            prop_schema = properties.get(key)
+            if prop_schema is None:
+                continue
+            enum_values = self._extract_enum_values(prop_schema)
+            if not enum_values:
+                continue
+            if value in enum_values:
+                continue
+            lower_map = {ev.lower(): ev for ev in enum_values if isinstance(ev, str)}
+            corrected_value = lower_map.get(value.lower())
+            if corrected_value is not None:
+                logger.debug(f"Auto-corrected enum value '{value}' -> '{corrected_value}' for parameter '{key}'")
+                corrected[key] = corrected_value
+        return corrected
+
+    @staticmethod
+    def _extract_enum_values(schema: dict[str, Any]) -> list[Any] | None:
+        """Extract enum values from a property schema, handling anyOf/oneOf."""
+        if "enum" in schema:
+            return schema["enum"]
+        for combiner in ("anyOf", "oneOf"):
+            if combiner in schema:
+                for sub_schema in schema[combiner]:
+                    if "enum" in sub_schema:
+                        return sub_schema["enum"]
+        return None
 
     def _is_validation_error_message(self, error_message: str) -> bool:
         """Return whether a tool error message appears to be an input validation failure."""
