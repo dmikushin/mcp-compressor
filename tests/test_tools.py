@@ -443,6 +443,18 @@ class TestToolNotFoundError:
         assert error.tool_name == "missing_tool"
         assert error.available_tools == ("add", "do_nothing")
 
+    def test_error_message_suggests_similar_tool_names(self) -> None:
+        """Test that the error message suggests similar tool names."""
+        error = ToolNotFoundError("get_pull_request", ["pull_request_read", "create_pull_request", "list_pull_requests"])
+        msg = str(error)
+        assert "Did you mean:" in msg
+        assert "pull_request_read" in msg or "create_pull_request" in msg
+
+    def test_error_message_no_suggestions_when_no_match(self) -> None:
+        """Test that no suggestions are shown when nothing is close."""
+        error = ToolNotFoundError("zzzzzzzzz", ["add", "do_nothing"])
+        assert "Did you mean:" not in str(error)
+
 
 async def test_on_call_tool_extracts_flat_args_as_tool_input(proxy_mcp_client) -> None:
     """Test that invoke_tool creates tool_input from flat args when tool_input is not provided."""

@@ -8,6 +8,7 @@ passthrough access.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import re
 from collections.abc import Sequence
@@ -41,8 +42,13 @@ class ToolNotFoundError(ValueError):
     def __init__(self, tool_name: str, available_tools: Sequence[str]) -> None:
         self.tool_name = tool_name
         self.available_tools = tuple(available_tools)
+        suggestions = difflib.get_close_matches(tool_name, self.available_tools, n=3, cutoff=0.4)
+        parts = [f"Tool '{tool_name}' not found."]
+        if suggestions:
+            parts.append(f"Did you mean: {', '.join(suggestions)}?")
         available_tools_text = ", ".join(self.available_tools) if self.available_tools else "(none)"
-        super().__init__(f"Tool '{tool_name}' not found in backend MCP server. Available tools: {available_tools_text}")
+        parts.append(f"Available tools: {available_tools_text}")
+        super().__init__(" ".join(parts))
 
 
 class InvokeToolCompatibilityMiddleware(Middleware):
