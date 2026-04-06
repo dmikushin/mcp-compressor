@@ -28,8 +28,7 @@ from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from fastmcp.client.auth import OAuth
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
-from fastmcp.server import create_proxy
-from fastmcp.server.providers.proxy import ProxyClient
+from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
 from key_value.aio.protocols import AsyncKeyValue
 from key_value.aio.stores.filetree import (
     FileTreeStore,
@@ -44,7 +43,7 @@ from .cli_bridge import CliBridge
 from .cli_script import generate_cli_script, remove_cli_script_entry
 from .cli_tools import sanitize_cli_name
 from .logging import configure_logging, suppress_recoverable_oauth_traceback_logging
-from .tools import CompressedTools
+from .tools import CompressedTools, ReloadableClientManager
 from .types import CompressionLevel, LogLevel, TransportType
 
 # Suppress known third-party deprecation warnings that are not actionable from this project.
@@ -306,14 +305,18 @@ async def _clear_transport_oauth_cache(transport: TransportType) -> None:
     await auth.token_storage_adapter.clear()
 
 
-@asynccontextmanager
-async def _proxy_client(transport: TransportType) -> AsyncGenerator[ProxyClient, None]:
-    """Connect a proxy client, retrying once after clearing stale cached OAuth state."""
+async def _connect_proxy_client(transport: TransportType) -> ProxyClient:
+    """Return a *connected* ProxyClient, retrying once after clearing stale cached OAuth state.
+
+    The caller is responsible for the client's lifecycle (in particular, calling
+    ``__aexit__`` when done).  This is a lower-level building block used by both the
+    initial connection and the reload flow.
+    """
     try:
         with suppress_recoverable_oauth_traceback_logging(transport):
-            async with ProxyClient(transport=transport, init_timeout=None) as client:
-                yield client
-                return
+            client = ProxyClient(transport=transport, init_timeout=None)
+            await client.__aenter__()
+            return client
     except Exception as exc:
         if not _should_retry_stale_oauth_connect_error(exc, transport):
             raise
@@ -324,14 +327,37 @@ async def _proxy_client(transport: TransportType) -> AsyncGenerator[ProxyClient,
         await _clear_transport_oauth_cache(transport)
 
     try:
-        async with ProxyClient(transport=transport, init_timeout=None) as client:
-            yield client
+        client = ProxyClient(transport=transport, init_timeout=None)
+        await client.__aenter__()
+        return client
     except Exception as exc:
         raise RuntimeError(
             f"{exc}\n\nCached OAuth credentials may be stale. "
             "mcp-compressor cleared cached OAuth state and retried once. "
             "If the problem persists, run 'mcp-compressor clear-oauth' and try again."
         ) from exc
+
+
+@asynccontextmanager
+async def _managed_proxy_client(
+    transport: TransportType,
+) -> AsyncGenerator[ReloadableClientManager, None]:
+    """Create and manage a ReloadableClientManager bound to ``transport``.
+
+    The manager is started on entry and stopped on exit.  Its ``connect`` closure
+    calls :func:`_connect_proxy_client` to produce a fresh connected client each time
+    reload is invoked.
+    """
+
+    async def connect() -> ProxyClient:
+        return await _connect_proxy_client(transport)
+
+    manager = ReloadableClientManager(connect=connect)
+    await manager.start()
+    try:
+        yield manager
+    finally:
+        await manager.stop()
 
 
 async def _async_main(
@@ -417,8 +443,8 @@ async def _server(
         return
 
     logger.info("Initializing proxy server")
-    async with _proxy_client(transport) as client:
-        mcp = create_proxy(client, name="MCP Compressor Proxy")
+    async with _managed_proxy_client(transport) as client_manager:
+        mcp = FastMCPProxy(client_factory=client_manager.get_client, name="MCP Compressor Proxy")
 
         # Shared compressed tools for backend access
         compressed_tools = CompressedTools(
@@ -428,6 +454,7 @@ async def _server(
             toonify=toonify,
             include_tools=include_tools,
             exclude_tools=exclude_tools,
+            client_manager=client_manager,
         )
 
         logger.info("Configuring compressed tools middleware")
@@ -457,9 +484,11 @@ async def _cli_mode_server(
     with cli_mode=True so CompressedTools registers the single help tool instead
     of the wrapper tools, and the bridge calls invoke_tool directly.
     """
-    async with _proxy_client(transport) as client:
+    async with _managed_proxy_client(transport) as client_manager:
         logger.info("Initializing proxy server for CLI mode")
-        mcp = create_proxy(client, name="MCP Compressor Proxy", version="0.1.0")
+        mcp = FastMCPProxy(
+            client_factory=client_manager.get_client, name="MCP Compressor Proxy", version="0.1.0"
+        )
 
         compressed_tools = CompressedTools(
             mcp,
@@ -470,6 +499,7 @@ async def _cli_mode_server(
             cli_name=cli_name,
             include_tools=include_tools,
             exclude_tools=exclude_tools,
+            client_manager=client_manager,
         )
         await compressed_tools.configure_server()
 

@@ -4,7 +4,12 @@ import pytest
 import toons
 from fastmcp.tools import Tool
 
-from mcp_compressor.tools import CompressedTools, ToolNotFoundError, sanitize_tool_name
+from mcp_compressor.tools import (
+    CompressedTools,
+    ReloadableClientManager,
+    ToolNotFoundError,
+    sanitize_tool_name,
+)
 from mcp_compressor.types import CompressionLevel
 
 
@@ -537,6 +542,142 @@ class TestToolNotFoundError:
         """Test that no suggestions are shown when nothing is close."""
         error = ToolNotFoundError("zzzzzzzzz", ["add", "do_nothing"])
         assert "Did you mean:" not in str(error)
+
+
+class TestReloadableClientManager:
+    """Tests for the ReloadableClientManager lifecycle."""
+
+    async def test_start_calls_connect_once(self) -> None:
+        """start() should create the initial client by calling connect() exactly once."""
+        call_count = 0
+
+        class FakeClient:
+            async def __aexit__(self, *args) -> None:
+                pass
+
+        async def connect() -> FakeClient:
+            nonlocal call_count
+            call_count += 1
+            return FakeClient()
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.start()
+        assert call_count == 1
+        assert manager.get_client() is not None
+
+        # Second start() is idempotent
+        await manager.start()
+        assert call_count == 1
+
+        await manager.stop()
+
+    async def test_reload_closes_old_and_creates_new_client(self) -> None:
+        """reload() should __aexit__ the old client and create a fresh one."""
+        closed_clients = []
+        created_clients = []
+
+        class FakeClient:
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+            async def __aexit__(self, *args) -> None:
+                closed_clients.append(self.label)
+
+        labels = iter(["client_1", "client_2", "client_3"])
+
+        async def connect() -> FakeClient:
+            client = FakeClient(next(labels))
+            created_clients.append(client.label)
+            return client
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.start()
+        assert created_clients == ["client_1"]
+        assert manager.get_client().label == "client_1"  # type: ignore[attr-defined]
+
+        await manager.reload()
+        assert closed_clients == ["client_1"]
+        assert created_clients == ["client_1", "client_2"]
+        assert manager.get_client().label == "client_2"  # type: ignore[attr-defined]
+
+        await manager.reload()
+        assert closed_clients == ["client_1", "client_2"]
+        assert created_clients == ["client_1", "client_2", "client_3"]
+        assert manager.get_client().label == "client_3"  # type: ignore[attr-defined]
+
+        await manager.stop()
+        assert closed_clients == ["client_1", "client_2", "client_3"]
+
+    async def test_get_client_raises_before_start(self) -> None:
+        """get_client() before start() should raise RuntimeError."""
+
+        async def connect():
+            raise AssertionError("should not be called")
+
+        manager = ReloadableClientManager(connect=connect)
+        with pytest.raises(RuntimeError, match="not started"):
+            manager.get_client()
+
+    async def test_reload_close_errors_are_suppressed(self) -> None:
+        """Errors during __aexit__ of the old client should not prevent reload."""
+
+        class FakeClient:
+            def __init__(self, fail_on_close: bool) -> None:
+                self.fail_on_close = fail_on_close
+
+            async def __aexit__(self, *args) -> None:
+                if self.fail_on_close:
+                    raise RuntimeError("simulated close failure")
+
+        call_count = 0
+
+        async def connect() -> FakeClient:
+            nonlocal call_count
+            call_count += 1
+            # First client fails on close; subsequent clients are clean
+            return FakeClient(fail_on_close=(call_count == 1))
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.start()
+        # Should not raise even though old client __aexit__ fails
+        await manager.reload()
+        assert call_count == 2
+        await manager.stop()
+
+
+class TestReloadToolExposure:
+    """Tests that CompressedTools exposes the reload tool iff a client manager is provided."""
+
+    def test_reload_tool_not_in_wrapper_set_without_manager(self) -> None:
+        compressed_tools = CompressedTools(None, CompressionLevel.LOW, server_name="test")  # type: ignore[arg-type]
+        assert compressed_tools._reload_tool_name not in compressed_tools._wrapper_tool_names()
+
+    def test_reload_tool_in_wrapper_set_with_manager(self) -> None:
+        class StubManager:
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            async def reload(self) -> None: ...
+            def get_client(self): ...
+
+        compressed_tools = CompressedTools(
+            None,  # type: ignore[arg-type]
+            CompressionLevel.LOW,
+            server_name="test",
+            client_manager=StubManager(),  # type: ignore[arg-type]
+        )
+        assert "test_reload" in compressed_tools._wrapper_tool_names()
+
+    def test_reload_tool_name_honors_server_prefix(self) -> None:
+        class StubManager:
+            async def reload(self) -> None: ...
+
+        compressed_tools = CompressedTools(
+            None,  # type: ignore[arg-type]
+            CompressionLevel.LOW,
+            server_name="github",
+            client_manager=StubManager(),  # type: ignore[arg-type]
+        )
+        assert compressed_tools._reload_tool_name == "github_reload"
 
 
 async def test_on_call_tool_extracts_flat_args_as_tool_input(proxy_mcp_client) -> None:

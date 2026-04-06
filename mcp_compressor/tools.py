@@ -8,18 +8,21 @@ passthrough access.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import toons
 from fastmcp import FastMCP
+from fastmcp.client import Client
 from fastmcp.exceptions import ToolError
 from fastmcp.resources import Resource
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.providers.proxy import ProxyClient
 from fastmcp.server.transforms import GetResourceNext, GetToolNext
 from fastmcp.server.transforms.catalog import CatalogTransform
 from fastmcp.tools import Tool
@@ -49,6 +52,66 @@ class ToolNotFoundError(ValueError):
         available_tools_text = ", ".join(self.available_tools) if self.available_tools else "(none)"
         parts.append(f"Available tools: {available_tools_text}")
         super().__init__(" ".join(parts))
+
+
+class ReloadableClientManager:
+    """Manages a reloadable MCP ProxyClient session.
+
+    The wrapped MCP server can be restarted in-place (e.g. to pick up a new backend
+    subprocess, or to recover from a hung connection) without restarting mcp-compressor
+    itself.  Exposes a ``get_client`` callable suitable for use as the FastMCPProxy
+    ``client_factory``.
+    """
+
+    def __init__(
+        self,
+        connect: Callable[[], Awaitable[Client]],
+    ) -> None:
+        """Create a manager.
+
+        Args:
+            connect: An async callable that creates a *connected* Client (i.e. already
+                inside its ``async with`` context).  The manager takes ownership of its
+                lifecycle; it will call ``__aexit__`` on the returned client on stop
+                and reload.  This callable is invoked once at start and again on each
+                reload.
+        """
+        self._connect = connect
+        self._current_client: Client | None = None
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        """Connect the initial client session."""
+        if self._current_client is not None:
+            return
+        self._current_client = await self._connect()
+
+    async def stop(self) -> None:
+        """Close the active client session, if any."""
+        async with self._lock:
+            await self._close_current()
+
+    async def reload(self) -> None:
+        """Close the current session and establish a new one."""
+        async with self._lock:
+            logger.info("Reloading wrapped MCP server backend")
+            await self._close_current()
+            self._current_client = await self._connect()
+            logger.info("Wrapped MCP server backend reloaded")
+
+    async def _close_current(self) -> None:
+        if self._current_client is None:
+            return
+        client = self._current_client
+        self._current_client = None
+        with contextlib.suppress(Exception):
+            await client.__aexit__(None, None, None)
+
+    def get_client(self) -> Client:
+        """Return the currently active client (factory for FastMCPProxy)."""
+        if self._current_client is None:
+            raise RuntimeError("ReloadableClientManager is not started")
+        return self._current_client
 
 
 class InvokeToolCompatibilityMiddleware(Middleware):
@@ -107,6 +170,7 @@ class CompressedTools(CatalogTransform):
         cli_name: str | None = None,
         include_tools: Sequence[str] | None = None,
         exclude_tools: Sequence[str] | None = None,
+        client_manager: ReloadableClientManager | None = None,
     ) -> None:
         super().__init__()
         self._proxy_server = proxy_server
@@ -118,6 +182,7 @@ class CompressedTools(CatalogTransform):
         self._cli_name = cli_name or (server_name or "mcp")
         self._include_tools = set(include_tools or [])
         self._exclude_tools = set(exclude_tools or [])
+        self._client_manager = client_manager
         self._cached_backend_tools: dict[str, Tool] | None = None
         self._tool_cache_lock: asyncio.Lock = asyncio.Lock()
         self._help_tool_name = sanitize_tool_name(f"{server_name}_help" if server_name else "help")
@@ -125,6 +190,7 @@ class CompressedTools(CatalogTransform):
         self._invoke_tool_name = sanitize_tool_name(f"{self._tool_name_prefix}invoke_tool")
         self._invoke_tool_alias_name = sanitize_tool_name("invoke_tool")
         self._list_tools_name = sanitize_tool_name(f"{self._tool_name_prefix}list_tools")
+        self._reload_tool_name = sanitize_tool_name(f"{self._tool_name_prefix}reload")
         self._uncompressed_tools_resource_uri = "compressor://uncompressed-tools"
 
     @property
@@ -140,10 +206,13 @@ class CompressedTools(CatalogTransform):
 
     def _wrapper_tool_names(self) -> set[str]:
         if self._cli_mode:
-            return {self._help_tool_name}
-        tool_names = {self._get_schema_tool_name, self._invoke_tool_name, self._invoke_tool_alias_name}
-        if self._compression_level == CompressionLevel.MAX:
-            tool_names.add(self._list_tools_name)
+            tool_names = {self._help_tool_name}
+        else:
+            tool_names = {self._get_schema_tool_name, self._invoke_tool_name, self._invoke_tool_alias_name}
+            if self._compression_level == CompressionLevel.MAX:
+                tool_names.add(self._list_tools_name)
+        if self._client_manager is not None:
+            tool_names.add(self._reload_tool_name)
         return tool_names
 
     async def configure_server(self) -> None:
@@ -179,14 +248,16 @@ class CompressedTools(CatalogTransform):
     async def transform_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
         """Replace the visible tool catalog with compressed wrapper tools."""
         if self._cli_mode:
-            return [self._make_help_tool(await self._build_cli_description_from(tools))]
-
-        visible_tools = [
-            self._make_get_schema_tool(await self._get_tool_descriptions_from(tools, self._compression_level)),
-            self._make_invoke_tool(self._invoke_tool_name),
-        ]
-        if self._compression_level == CompressionLevel.MAX:
-            visible_tools.append(self._make_list_tools_tool())
+            visible_tools = [self._make_help_tool(await self._build_cli_description_from(tools))]
+        else:
+            visible_tools = [
+                self._make_get_schema_tool(await self._get_tool_descriptions_from(tools, self._compression_level)),
+                self._make_invoke_tool(self._invoke_tool_name),
+            ]
+            if self._compression_level == CompressionLevel.MAX:
+                visible_tools.append(self._make_list_tools_tool())
+        if self._client_manager is not None:
+            visible_tools.append(self._make_reload_tool())
         return visible_tools
 
     async def get_tool(self, name: str, call_next: GetToolNext, *, version: Any | None = None) -> Tool | None:
@@ -199,6 +270,8 @@ class CompressedTools(CatalogTransform):
             return self._make_invoke_tool(name)
         if name == self._list_tools_name and self._compression_level == CompressionLevel.MAX:
             return self._make_list_tools_tool()
+        if self._client_manager is not None and name == self._reload_tool_name:
+            return self._make_reload_tool()
         return await call_next(name, version=version)
 
     async def transform_resources(self, resources: Sequence[Resource]) -> Sequence[Resource]:
@@ -222,6 +295,43 @@ class CompressedTools(CatalogTransform):
                 return await self.list_tools_tool(active_ctx)
         backend_tools = await self._get_backend_tools(ctx)
         return await self._get_tool_descriptions_from(list(backend_tools.values()), CompressionLevel.MEDIUM)
+
+    async def reload_backend(self) -> str:
+        """Reload the wrapped MCP server by reconnecting its backend session.
+
+        Closes the current backend connection (which for stdio servers terminates the
+        subprocess) and establishes a fresh one, then re-fetches the tool catalog so
+        that subsequent calls see the restarted backend.
+        """
+        if self._client_manager is None:
+            raise ToolError("This compressor instance is not configured with a reloadable client manager.")
+        await self._client_manager.reload()
+        self.invalidate_tool_cache()
+        try:
+            backend_tools = await self.get_backend_tools()
+        except Exception as exc:
+            raise ToolError(f"Backend reloaded but tool catalog refresh failed: {exc}") from exc
+        await self._configure_backend_tool_visibility_post_reload()
+        return (
+            f"Reloaded wrapped MCP server for {self._server_description}. "
+            f"{len(backend_tools)} tools available."
+        )
+
+    async def _configure_backend_tool_visibility_post_reload(self) -> None:
+        """Re-apply include/exclude visibility filters after a reload."""
+        if not self._include_tools and not self._exclude_tools:
+            return
+        all_tools = await self._proxy_server.list_tools(run_middleware=False)
+        if self._include_tools:
+            all_tool_names = {tool.name for tool in all_tools}
+            names_to_disable = all_tool_names - self._include_tools
+            if names_to_disable:
+                self._proxy_server.disable(names=names_to_disable, components={"tool"})
+        if self._exclude_tools:
+            self._proxy_server.disable(names=self._exclude_tools, components={"tool"})
+        # Re-warm cache with filtered tool set
+        visible_tools = await self._proxy_server.list_tools(run_middleware=False)
+        self._cached_backend_tools = {tool.name: tool for tool in visible_tools}
 
     async def get_tool_schema(self, tool_name: str, ctx: Context = None) -> str:  # type: ignore[assignment]
         """Get the input schema for a specific tool from {server_description}."""
@@ -421,6 +531,15 @@ class CompressedTools(CatalogTransform):
     def _make_list_tools_tool(self) -> Tool:
         description = f"List all available tools in {self._server_description}."
         return Tool.from_function(self.list_tools_tool, name=self._list_tools_name, description=description)
+
+    def _make_reload_tool(self) -> Tool:
+        description = (
+            f"Reload the wrapped MCP server backing {self._server_description}. "
+            "Closes the current backend session and establishes a fresh one, then "
+            "re-fetches the tool catalog. Useful when the backend server process needs "
+            "to be restarted (e.g. to pick up new code) without restarting the agent."
+        )
+        return Tool.from_function(self.reload_backend, name=self._reload_tool_name, description=description)
 
     def _make_uncompressed_tools_resource(self) -> Resource:
         return Resource.from_function(
