@@ -41,6 +41,7 @@ from loguru import logger
 from .banner import print_banner
 from .cli_bridge import CliBridge
 from .cli_script import generate_cli_script, remove_cli_script_entry
+from . import catalog_cache as _catalog_cache
 from .cli_tools import sanitize_cli_name
 from .logging import configure_logging, suppress_recoverable_oauth_traceback_logging
 from .tools import CompressedTools, ReloadableClientManager
@@ -183,6 +184,18 @@ def main(
             help="Comma-separated list of wrapped server tool names to hide.",
         ),
     ] = None,
+    lazy: Annotated[
+        bool,
+        typer.Option(
+            ...,
+            "--lazy",
+            help=(
+                "Enable lazy loading: serve the tool catalog from a local disk cache and only start the wrapped "
+                "MCP server subprocess when a tool is actually invoked. The catalog is cached on first run and "
+                "refreshed on reload. Saves resources when many MCP servers are configured but not all are used."
+            ),
+        ),
+    ] = False,
 ):
     """Run the MCP Compressor proxy server.
 
@@ -236,6 +249,7 @@ def main(
             cli_port=cli_port,
             include_tools=_parse_tool_name_list(include_tools),
             exclude_tools=_parse_tool_name_list(exclude_tools),
+            lazy=lazy,
         )
     )
 
@@ -341,19 +355,21 @@ async def _connect_proxy_client(transport: TransportType) -> ProxyClient:
 @asynccontextmanager
 async def _managed_proxy_client(
     transport: TransportType,
+    lazy: bool = False,
 ) -> AsyncGenerator[ReloadableClientManager, None]:
     """Create and manage a ReloadableClientManager bound to ``transport``.
 
-    The manager is started on entry and stopped on exit.  Its ``connect`` closure
-    calls :func:`_connect_proxy_client` to produce a fresh connected client each time
-    reload is invoked.
+    The manager is started on entry (unless ``lazy=True``) and stopped on exit.
+    Its ``connect`` closure calls :func:`_connect_proxy_client` to produce a fresh
+    connected client each time start/reload is invoked.
     """
 
     async def connect() -> ProxyClient:
         return await _connect_proxy_client(transport)
 
     manager = ReloadableClientManager(connect=connect)
-    await manager.start()
+    if not lazy:
+        await manager.start()
     try:
         yield manager
     finally:
@@ -374,6 +390,7 @@ async def _async_main(
     cli_port: int | None = None,
     include_tools: list[str] | None = None,
     exclude_tools: list[str] | None = None,
+    lazy: bool = False,
 ) -> None:
     """Run the MCP Compressor proxy server asynchronously."""
     logger.info(f"Starting MCP Compressor with log level: {log_level.value}")
@@ -391,6 +408,7 @@ async def _async_main(
         cli_port=cli_port,
         include_tools=include_tools,
         exclude_tools=exclude_tools,
+        lazy=lazy,
     ) as mcp:
         logger.info("Starting MCP Compressor server")
         await mcp.run_async(show_banner=False, log_level=log_level.value)
@@ -410,6 +428,7 @@ async def _server(
     cli_port: int | None = None,
     include_tools: list[str] | None = None,
     exclude_tools: list[str] | None = None,
+    lazy: bool = False,
 ) -> AsyncGenerator[FastMCP, None]:
     command_or_url = " ".join(command_or_url_list)
     transport_type = _infer_transport_type(command_or_url)
@@ -442,8 +461,10 @@ async def _server(
             yield mcp
         return
 
+    catalog_cache_key = _catalog_cache.make_cache_key(command_or_url, include_tools, exclude_tools) if lazy else None
+
     logger.info("Initializing proxy server")
-    async with _managed_proxy_client(transport) as client_manager:
+    async with _managed_proxy_client(transport, lazy=lazy) as client_manager:
         mcp = FastMCPProxy(client_factory=client_manager.get_client, name="MCP Compressor Proxy")
 
         # Shared compressed tools for backend access
@@ -455,6 +476,7 @@ async def _server(
             include_tools=include_tools,
             exclude_tools=exclude_tools,
             client_manager=client_manager,
+            catalog_cache_key=catalog_cache_key,
         )
 
         logger.info("Configuring compressed tools middleware")

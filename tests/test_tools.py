@@ -5,6 +5,7 @@ import toons
 from fastmcp.tools import Tool
 
 from mcp_compressor.tools import (
+    CachedTool,
     CompressedTools,
     ReloadableClientManager,
     ToolNotFoundError,
@@ -678,6 +679,142 @@ class TestReloadToolExposure:
             client_manager=StubManager(),  # type: ignore[arg-type]
         )
         assert compressed_tools._reload_tool_name == "github_reload"
+
+
+class TestCachedTool:
+    """Tests for the CachedTool lazy-loading stub."""
+
+    def test_from_mcp_dict_round_trip(self) -> None:
+        data = {
+            "name": "pull_request_read",
+            "description": "Read a pull request.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}},
+                "required": ["owner", "repo"],
+            },
+        }
+        tool = CachedTool.from_mcp_dict(data)
+        assert tool.name == "pull_request_read"
+        assert tool.description == "Read a pull request."
+        assert tool.parameters == data["inputSchema"]
+
+    def test_from_mcp_dict_missing_description(self) -> None:
+        data = {"name": "empty_tool", "inputSchema": {}}
+        tool = CachedTool.from_mcp_dict(data)
+        assert tool.description is None
+
+    def test_format_description_works_with_cached_tool(self) -> None:
+        """CompressedTools._format_tool_description must accept CachedTool stubs."""
+        ct = CompressedTools(None, CompressionLevel.LOW, server_name="test")  # type: ignore[arg-type]
+        stub = CachedTool(name="my_tool", description="Does stuff.", parameters={"properties": {"x": {}}})
+        result = ct._format_tool_description(stub, CompressionLevel.HIGH)  # type: ignore[arg-type]
+        assert "<tool>my_tool" in result
+        assert "</tool>" in result
+
+
+class TestEnsureConnected:
+    """Tests for ReloadableClientManager.ensure_connected (lazy-mode helper)."""
+
+    async def test_ensure_connected_when_not_connected(self) -> None:
+        """ensure_connected() should call connect() if not yet connected."""
+        call_count = 0
+
+        class FakeClient:
+            async def __aexit__(self, *args) -> None:
+                pass
+
+        async def connect() -> FakeClient:
+            nonlocal call_count
+            call_count += 1
+            return FakeClient()
+
+        manager = ReloadableClientManager(connect=connect)
+        assert not manager.is_connected
+        await manager.ensure_connected()
+        assert call_count == 1
+        assert manager.is_connected
+        await manager.stop()
+
+    async def test_ensure_connected_idempotent(self) -> None:
+        """Multiple ensure_connected() calls must not reconnect."""
+        call_count = 0
+
+        class FakeClient:
+            async def __aexit__(self, *args) -> None:
+                pass
+
+        async def connect() -> FakeClient:
+            nonlocal call_count
+            call_count += 1
+            return FakeClient()
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.ensure_connected()
+        await manager.ensure_connected()
+        await manager.ensure_connected()
+        assert call_count == 1
+        await manager.stop()
+
+    async def test_is_connected_false_before_start(self) -> None:
+        manager = ReloadableClientManager(connect=lambda: None)  # type: ignore[arg-type]
+        assert not manager.is_connected
+
+    async def test_is_connected_true_after_start(self) -> None:
+        class FakeClient:
+            async def __aexit__(self, *args) -> None:
+                pass
+
+        async def connect() -> FakeClient:
+            return FakeClient()
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.start()
+        assert manager.is_connected
+        await manager.stop()
+        assert not manager.is_connected
+
+
+class TestCatalogCache:
+    """Tests for the catalog_cache module."""
+
+    def test_load_returns_none_on_cache_miss(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        assert cc.load("nonexistent") is None
+
+    def test_save_and_load_round_trip(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        tools = [{"name": "foo", "description": "Foo tool.", "inputSchema": {"properties": {}}}]
+        cc.save("mykey", tools)
+        loaded = cc.load("mykey")
+        assert loaded == tools
+
+    def test_clear_removes_cache(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cc.save("mykey", [{"name": "x", "inputSchema": {}}])
+        assert cc.load("mykey") is not None
+        cc.clear("mykey")
+        assert cc.load("mykey") is None
+
+    def test_make_cache_key_stable(self) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        k1 = cc.make_cache_key("uvx mcp-github")
+        k2 = cc.make_cache_key("uvx mcp-github")
+        assert k1 == k2
+
+    def test_make_cache_key_differs_with_filters(self) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        k1 = cc.make_cache_key("uvx mcp-github")
+        k2 = cc.make_cache_key("uvx mcp-github", include_tools=["foo"])
+        assert k1 != k2
 
 
 async def test_on_call_tool_extracts_flat_args_as_tool_input(proxy_mcp_client) -> None:

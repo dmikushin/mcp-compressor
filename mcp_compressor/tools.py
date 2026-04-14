@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import difflib
 import json
 import re
@@ -31,12 +32,36 @@ from loguru import logger
 from mcp.types import CallToolRequestParams, ContentBlock, TextContent
 from pydantic import ValidationError
 
+from . import catalog_cache as _catalog_cache
 from .cli_script import find_script_dir
 from .cli_tools import build_help_tool_description
 from .types import CompressionLevel
 
 # Minimum output length before quiet mode truncation applies
 QUIET_MODE_THRESHOLD = 1000
+
+
+@dataclasses.dataclass
+class CachedTool:
+    """Lightweight tool metadata stub used in lazy-loading mode.
+
+    Holds only the fields needed for list/schema operations (``name``,
+    ``description``, ``parameters``).  When the backend is finally connected the
+    stub is replaced by a real ``ProxyTool`` that can be invoked.
+    """
+
+    name: str
+    description: str | None
+    parameters: dict[str, Any]
+
+    @classmethod
+    def from_mcp_dict(cls, data: dict[str, Any]) -> CachedTool:
+        """Reconstruct a stub from the JSON dict produced by ``tool.to_mcp_tool().model_dump()``."""
+        return cls(
+            name=data["name"],
+            description=data.get("description"),
+            parameters=data.get("inputSchema", {}),
+        )
 
 
 class ToolNotFoundError(ValueError):
@@ -107,6 +132,20 @@ class ReloadableClientManager:
         with contextlib.suppress(Exception):
             await client.__aexit__(None, None, None)
 
+    @property
+    def is_connected(self) -> bool:
+        """Return whether a live backend session exists."""
+        return self._current_client is not None
+
+    async def ensure_connected(self) -> None:
+        """Connect if not already connected (used by lazy-loading mode)."""
+        if self._current_client is not None:
+            return
+        async with self._lock:
+            if self._current_client is None:
+                logger.info("Lazy-connecting wrapped MCP server backend on first use")
+                self._current_client = await self._connect()
+
     def get_client(self) -> Client:
         """Return the currently active client (factory for FastMCPProxy)."""
         if self._current_client is None:
@@ -171,6 +210,7 @@ class CompressedTools(CatalogTransform):
         include_tools: Sequence[str] | None = None,
         exclude_tools: Sequence[str] | None = None,
         client_manager: ReloadableClientManager | None = None,
+        catalog_cache_key: str | None = None,
     ) -> None:
         super().__init__()
         self._proxy_server = proxy_server
@@ -183,7 +223,8 @@ class CompressedTools(CatalogTransform):
         self._include_tools = set(include_tools or [])
         self._exclude_tools = set(exclude_tools or [])
         self._client_manager = client_manager
-        self._cached_backend_tools: dict[str, Tool] | None = None
+        self._catalog_cache_key = catalog_cache_key
+        self._cached_backend_tools: dict[str, Tool | CachedTool] | None = None
         self._tool_cache_lock: asyncio.Lock = asyncio.Lock()
         self._help_tool_name = sanitize_tool_name(f"{server_name}_help" if server_name else "help")
         self._get_schema_tool_name = sanitize_tool_name(f"{self._tool_name_prefix}get_tool_schema")
@@ -223,7 +264,36 @@ class CompressedTools(CatalogTransform):
             self._proxy_server.add_middleware(InvokeToolCompatibilityMiddleware(self))
 
     async def _configure_backend_tool_visibility(self) -> None:
-        """Apply FastMCP visibility rules for backend tool allow/deny filtering."""
+        """Populate the tool cache, connecting to the backend or loading from disk cache.
+
+        In lazy mode (client_manager not connected + catalog_cache_key provided):
+        - If a disk cache exists: populate ``_cached_backend_tools`` with ``CachedTool``
+          stubs and skip the backend connection entirely.
+        - If no disk cache: fall through to the eager path which connects, fetches the
+          catalog, and saves it to disk for next time.
+
+        In normal (eager) mode: connect immediately and fetch the catalog from the backend.
+        """
+        lazy = (
+            self._catalog_cache_key is not None
+            and self._client_manager is not None
+            and not self._client_manager.is_connected
+        )
+        if lazy:
+            cached = _catalog_cache.load(self._catalog_cache_key)  # type: ignore[arg-type]
+            if cached is not None:
+                logger.info(
+                    f"Lazy mode: loaded {len(cached)} tool(s) from disk cache "
+                    f"(key={self._catalog_cache_key!r}); backend not started."
+                )
+                self._cached_backend_tools = {
+                    entry["name"]: CachedTool.from_mcp_dict(entry) for entry in cached
+                }
+                return
+            # Cache miss in lazy mode → fall through and connect eagerly this time
+            logger.info("Lazy mode: no disk cache found; connecting backend to build initial catalog.")
+            await self._client_manager.ensure_connected()  # type: ignore[union-attr]
+
         all_tools = await self._proxy_server.list_tools(run_middleware=False)
         filters_applied = False
         if self._include_tools:
@@ -244,14 +314,27 @@ class CompressedTools(CatalogTransform):
         else:
             visible_tools = all_tools
         self._cached_backend_tools = {tool.name: tool for tool in visible_tools}
+        # Persist the catalog to disk if a cache key is configured.
+        if self._catalog_cache_key:
+            self._save_catalog_cache(list(visible_tools))
 
     async def transform_tools(self, tools: Sequence[Tool]) -> Sequence[Tool]:
-        """Replace the visible tool catalog with compressed wrapper tools."""
+        """Replace the visible tool catalog with compressed wrapper tools.
+
+        Prefers ``_cached_backend_tools`` over the ``tools`` parameter passed by FastMCP.
+        This allows lazy mode to serve the cached catalog even when the backend is not
+        yet connected (in which case ``tools`` would be empty).
+        """
+        effective = (
+            list(self._cached_backend_tools.values())
+            if self._cached_backend_tools is not None
+            else list(tools)
+        )
         if self._cli_mode:
-            visible_tools = [self._make_help_tool(await self._build_cli_description_from(tools))]
+            visible_tools = [self._make_help_tool(await self._build_cli_description_from(effective))]
         else:
             visible_tools = [
-                self._make_get_schema_tool(await self._get_tool_descriptions_from(tools, self._compression_level)),
+                self._make_get_schema_tool(await self._get_tool_descriptions_from(effective, self._compression_level)),
                 self._make_invoke_tool(self._invoke_tool_name),
             ]
             if self._compression_level == CompressionLevel.MAX:
@@ -318,9 +401,7 @@ class CompressedTools(CatalogTransform):
         )
 
     async def _configure_backend_tool_visibility_post_reload(self) -> None:
-        """Re-apply include/exclude visibility filters after a reload."""
-        if not self._include_tools and not self._exclude_tools:
-            return
+        """Re-apply include/exclude visibility filters after a reload and update the disk cache."""
         all_tools = await self._proxy_server.list_tools(run_middleware=False)
         if self._include_tools:
             all_tool_names = {tool.name for tool in all_tools}
@@ -332,6 +413,36 @@ class CompressedTools(CatalogTransform):
         # Re-warm cache with filtered tool set
         visible_tools = await self._proxy_server.list_tools(run_middleware=False)
         self._cached_backend_tools = {tool.name: tool for tool in visible_tools}
+        if self._catalog_cache_key:
+            self._save_catalog_cache(list(visible_tools))
+
+    async def _lazy_connect_and_populate(self) -> None:
+        """Connect the backend on first use and replace CachedTool stubs with real ProxyTools.
+
+        Called transparently from ``invoke_tool`` when the backend has not been started yet
+        (lazy mode with a cache hit at startup).  Uses ``_tool_cache_lock`` to prevent
+        multiple concurrent invocations from all trying to connect simultaneously.
+        """
+        if self._client_manager is None:
+            return
+        async with self._tool_cache_lock:
+            # Check again inside the lock — another coroutine may have connected already.
+            if self._cached_backend_tools and not any(
+                isinstance(t, CachedTool) for t in self._cached_backend_tools.values()
+            ):
+                return
+            logger.info("Lazy mode: first invoke_tool — connecting backend and populating real tool catalog.")
+            await self._client_manager.ensure_connected()
+            await self._configure_backend_tool_visibility_post_reload()
+
+    def _save_catalog_cache(self, tools: list[Tool]) -> None:
+        """Persist the tool catalog to disk for future lazy-loading starts."""
+        try:
+            data = [t.to_mcp_tool().model_dump(mode="json") for t in tools]
+            _catalog_cache.save(self._catalog_cache_key, data)  # type: ignore[arg-type]
+            logger.debug(f"Saved {len(data)} tool(s) to catalog cache (key={self._catalog_cache_key!r})")
+        except Exception as exc:
+            logger.warning(f"Failed to save catalog cache: {exc}")
 
     async def get_tool_schema(self, tool_name: str, ctx: Context = None) -> str:  # type: ignore[assignment]
         """Get the input schema for a specific tool from {server_description}."""
@@ -354,6 +465,10 @@ class CompressedTools(CatalogTransform):
             async with Context(fastmcp=self._proxy_server) as active_ctx:
                 return await self.invoke_tool(tool_name, tool_input, quiet, active_ctx)
         tool = await self._get_backend_tool(ctx, tool_name)
+        # Lazy mode: if the cached tool is a stub (no .run()), connect backend now.
+        if isinstance(tool, CachedTool):
+            await self._lazy_connect_and_populate()
+            tool = await self._get_backend_tool(ctx, tool_name)
         if tool_input:
             tool_input = self._autocorrect_param_names(tool, tool_input)
             tool_input = self._autocorrect_enum_values(tool, tool_input)
@@ -393,7 +508,15 @@ class CompressedTools(CatalogTransform):
             async with Context(fastmcp=self._proxy_server) as active_ctx:
                 return await self.list_uncompressed_tools(active_ctx)
         backend_tools = await self._get_backend_tools(ctx)
-        return json.dumps([tool.to_mcp_tool().model_dump(mode="json") for tool in backend_tools.values()], indent=2)
+        return json.dumps(
+            [
+                tool.to_mcp_tool().model_dump(mode="json")  # type: ignore[union-attr]
+                if not isinstance(tool, CachedTool)
+                else {"name": tool.name, "description": tool.description, "inputSchema": tool.parameters}
+                for tool in backend_tools.values()
+            ],
+            indent=2,
+        )
 
     async def get_backend_tools(self) -> dict[str, Tool]:
         """Return the current backend tool catalog keyed by name."""
