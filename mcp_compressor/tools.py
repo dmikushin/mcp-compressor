@@ -456,11 +456,13 @@ class CompressedTools(CatalogTransform):
     async def invoke_tool(
         self,
         tool_name: str,
-        tool_input: dict[str, Any] | None = None,
+        tool_input: str | dict[str, Any] | None = None,
         quiet: bool = False,
         ctx: Context = None,  # type: ignore[assignment]
     ) -> ToolResult:
         """Invoke a backend tool from the compressed catalog."""
+        if isinstance(tool_input, str):
+            tool_input = json.loads(tool_input)
         if ctx is None:
             async with Context(fastmcp=self._proxy_server) as active_ctx:
                 return await self.invoke_tool(tool_name, tool_input, quiet, active_ctx)
