@@ -402,7 +402,13 @@ class CompressedTools(CatalogTransform):
 
     async def _configure_backend_tool_visibility_post_reload(self) -> None:
         """Re-apply include/exclude visibility filters after a reload and update the disk cache."""
-        all_tools = await self._proxy_server.list_tools(run_middleware=False)
+        # Use get_tool_catalog() to bypass the CatalogTransform that is already
+        # attached to the proxy server.  list_tools(run_middleware=False) only
+        # skips middleware, NOT transforms — so after the first configure_server()
+        # call it would return the compressed wrapper tools instead of the raw
+        # backend catalog.
+        async with Context(fastmcp=self._proxy_server) as ctx:
+            all_tools = list(await self.get_tool_catalog(ctx, run_middleware=False))
         if self._include_tools:
             all_tool_names = {tool.name for tool in all_tools}
             names_to_disable = all_tool_names - self._include_tools
@@ -411,7 +417,11 @@ class CompressedTools(CatalogTransform):
         if self._exclude_tools:
             self._proxy_server.disable(names=self._exclude_tools, components={"tool"})
         # Re-warm cache with filtered tool set
-        visible_tools = await self._proxy_server.list_tools(run_middleware=False)
+        if self._include_tools or self._exclude_tools:
+            async with Context(fastmcp=self._proxy_server) as ctx:
+                visible_tools = list(await self.get_tool_catalog(ctx, run_middleware=False))
+        else:
+            visible_tools = all_tools
         self._cached_backend_tools = {tool.name: tool for tool in visible_tools}
         if self._catalog_cache_key:
             self._save_catalog_cache(list(visible_tools))
