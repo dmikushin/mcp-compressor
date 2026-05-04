@@ -540,7 +540,7 @@ class CompressedTools(CatalogTransform):
         backend_tools = await self.get_backend_tools()
         original_tool_count = len(backend_tools)
         original_schema_size = sum(
-            len(json.dumps(tool.parameters)) + len(json.dumps(tool.output_schema)) + len(tool.description or "")
+            len(json.dumps(tool.parameters)) + len(json.dumps(getattr(tool, 'output_schema', None))) + len(tool.description or "")
             for tool in backend_tools.values()
         )
         compressed_schema_sizes: dict[CompressionLevel | str, int] = {}
