@@ -24,6 +24,7 @@ import keyring
 import keyring.errors
 import psutil
 import typer
+import uvicorn
 from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from fastmcp.client.auth import OAuth
@@ -58,7 +59,7 @@ app = typer.Typer(name="MCP Compressor", help="An MCP server wrapper for reducin
 @app.command()
 def main(
     command_or_url_list: Annotated[
-        list[str],
+        list[str] | None,
         typer.Argument(
             ...,
             metavar="COMMAND_OR_URL",
@@ -67,7 +68,7 @@ def main(
                 "arguments to run for stdio servers. Example: uvx mcp-server-fetch"
             ),
         ),
-    ],
+    ] = None,
     cwd: Annotated[
         str | None,
         typer.Option(
@@ -196,6 +197,25 @@ def main(
             ),
         ),
     ] = False,
+    server_mode: Annotated[
+        bool,
+        typer.Option(
+            ...,
+            "--server",
+            help=(
+                "Run as a shared backend pool daemon. Without --server, mcp-compressor acts as a client "
+                "that connects to the pool on --server-port and spawns its backend on demand."
+            ),
+        ),
+    ] = False,
+    server_port: Annotated[
+        int,
+        typer.Option(
+            ...,
+            "--server-port",
+            help="Port for the server daemon to listen on, or for the client to connect to.",
+        ),
+    ] = 9020,
 ):
     """Run the MCP Compressor proxy server.
 
@@ -203,6 +223,12 @@ def main(
     (via stdio, HTTP, or SSE) and wraps it with a compressed tool interface.
     """
     configure_logging(log_level)
+
+    # Validate mode flags
+    if not server_mode and not command_or_url_list:
+        raise typer.BadParameter(
+            "COMMAND_OR_URL is required in client mode.", param_hint="'COMMAND_OR_URL'"
+        )
 
     if cli_mode and server_name is None:
         raise typer.BadParameter("--server-name is required when using --cli-mode.", param_hint="'--server-name'")
@@ -212,27 +238,42 @@ def main(
         )
 
     if threading.current_thread() is threading.main_thread():
-        shutting_down = False
+        if server_mode:
+            # In server mode, let uvicorn handle SIGTERM gracefully for systemd compatibility.
+            def _handle_interrupt_server(signum: int, frame: object) -> None:
+                logger.info("Server stopping (signal received)")
+                with contextlib.suppress(Exception):
+                    current = psutil.Process()
+                    for child in current.children(recursive=True):
+                        with contextlib.suppress(Exception):
+                            child.terminate()
+                # Let uvicorn's signal handler do the rest
+                raise KeyboardInterrupt
 
-        def _handle_interrupt(signum: int, frame: object) -> None:
-            nonlocal shutting_down
-            if shutting_down:
-                logger.debug("Ignoring additional interrupt signal during shutdown")
-                return
-            shutting_down = True
-            logger.info("Server stopped")
-            # Terminate child processes (stdio backend server) to avoid zombies
-            with contextlib.suppress(Exception):
-                current = psutil.Process()
-                for child in current.children(recursive=True):
-                    with contextlib.suppress(Exception):
-                        child.terminate()
-            # os._exit(0) bypasses daemon thread join hangs (both stdio stdin-read
-            # threads and HTTP transport threads can block interpreter shutdown)
-            os._exit(0)
+            signal.signal(signal.SIGINT, _handle_interrupt_server)
+            signal.signal(signal.SIGTERM, _handle_interrupt_server)
+        else:
+            shutting_down = False
 
-        signal.signal(signal.SIGINT, _handle_interrupt)
-        signal.signal(signal.SIGTERM, _handle_interrupt)
+            def _handle_interrupt(signum: int, frame: object) -> None:
+                nonlocal shutting_down
+                if shutting_down:
+                    logger.debug("Ignoring additional interrupt signal during shutdown")
+                    return
+                shutting_down = True
+                logger.info("Server stopped")
+                # Terminate child processes (stdio backend server) to avoid zombies
+                with contextlib.suppress(Exception):
+                    current = psutil.Process()
+                    for child in current.children(recursive=True):
+                        with contextlib.suppress(Exception):
+                            child.terminate()
+                # os._exit(0) bypasses daemon thread join hangs (both stdio stdin-read
+                # threads and HTTP transport threads can block interpreter shutdown)
+                os._exit(0)
+
+            signal.signal(signal.SIGINT, _handle_interrupt)
+            signal.signal(signal.SIGTERM, _handle_interrupt)
 
     asyncio.run(
         _async_main(
@@ -250,6 +291,8 @@ def main(
             include_tools=_parse_tool_name_list(include_tools),
             exclude_tools=_parse_tool_name_list(exclude_tools),
             lazy=lazy,
+            server_mode=server_mode,
+            server_port=server_port,
         )
     )
 
@@ -377,7 +420,7 @@ async def _managed_proxy_client(
 
 
 async def _async_main(
-    command_or_url_list: list[str],
+    command_or_url_list: list[str] | None,
     cwd: str | None,
     env_list: list[str] | None,
     header_list: list[str] | None,
@@ -391,27 +434,33 @@ async def _async_main(
     include_tools: list[str] | None = None,
     exclude_tools: list[str] | None = None,
     lazy: bool = False,
+    server_mode: bool = False,
+    server_port: int = 9020,
 ) -> None:
     """Run the MCP Compressor proxy server asynchronously."""
     logger.info(f"Starting MCP Compressor with log level: {log_level.value}")
 
-    async with _server(
-        command_or_url_list=command_or_url_list,
-        cwd=cwd,
-        env_list=env_list,
-        header_list=header_list,
-        timeout=timeout,
-        compression_level=compression_level,
-        server_name=server_name,
-        toonify=toonify,
-        cli_mode=cli_mode,
-        cli_port=cli_port,
-        include_tools=include_tools,
-        exclude_tools=exclude_tools,
-        lazy=lazy,
-    ) as mcp:
-        logger.info("Starting MCP Compressor server")
-        await mcp.run_async(show_banner=False, log_level=log_level.value)
+    if server_mode:
+        from .server import BackendPool, create_pool_app
+
+        pool = BackendPool(log_level=log_level.value)
+        app = create_pool_app(pool)
+        config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level=log_level.value)
+        uvicorn_server = uvicorn.Server(config)
+        logger.info(f"MCP Compressor backend pool on http://127.0.0.1:{server_port}")
+        await uvicorn_server.serve()
+    else:
+        # Client mode: connect to pool, spawn backend, proxy tools
+        async with _client_mode(
+            port=server_port,
+            command_or_url_list=command_or_url_list,  # type: ignore[arg-type]  # validated non-None in main()
+            env_list=env_list,
+            compression_level=compression_level,
+            server_name=server_name,
+            toonify=toonify,
+        ) as mcp:
+            logger.info("Starting MCP Compressor client")
+            await mcp.run_async(show_banner=False, log_level=log_level.value)
 
 
 @asynccontextmanager
@@ -486,6 +535,73 @@ async def _server(
         print_banner(server_name, transport_type, stats, compression_level)
 
         yield mcp
+
+
+@asynccontextmanager
+async def _client_mode(
+    port: int,
+    command_or_url_list: list[str],
+    env_list: list[str] | None = None,
+    compression_level: CompressionLevel = CompressionLevel.MEDIUM,
+    server_name: str | None = None,
+    toonify: bool = False,
+) -> AsyncGenerator[FastMCP, None]:
+    """Connect to a shared MCP Compressor server as a thin passthrough client.
+
+    Sends the backend command to the server's ``/spawn`` endpoint, which starts
+    the backend (or returns an existing one), then creates a FastMCPProxy that
+    passes through the server's already-compressed tool catalog.
+    """
+    spawn_result = await _spawn_on_server(port, command_or_url_list, env_list, compression_level, server_name)
+    backend_port = spawn_result["port"]
+    backend_key = spawn_result["backend_key"]
+    tool_count = spawn_result["tool_count"]
+
+    url = f"http://127.0.0.1:{backend_port}/mcp"
+    transport = StreamableHttpTransport(url=url)
+    async with _managed_proxy_client(transport) as client_manager:
+        mcp = FastMCPProxy(
+            client_factory=client_manager.get_client,
+            name="MCP Compressor Client",
+        )
+        logger.info(f"Connected to shared backend {backend_key!r} ({tool_count} tools) at {url}")
+        print(f"MCP Compressor client -> {url} ({tool_count} tools)", file=sys.stderr)
+        yield mcp
+
+
+async def _spawn_on_server(
+    port: int,
+    command_or_url_list: list[str],
+    env_list: list[str] | None = None,
+    compression_level: CompressionLevel = CompressionLevel.MEDIUM,
+    server_name: str | None = None,
+) -> dict[str, Any]:
+    """Ask the pool server to start a backend and return its connection info."""
+    import httpx
+
+    command = command_or_url_list[0]
+    args = command_or_url_list[1:]
+    env: dict[str, str] | None = None
+    if env_list:
+        env = {}
+        for var in env_list:
+            key, val = var.split("=", 1)
+            env[key] = _interpolate_string(val)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"http://127.0.0.1:{port}/spawn",
+            json={
+                "command": command,
+                "args": args,
+                "env": env,
+                "compression_level": compression_level.value,
+                "server_name": server_name,
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 @asynccontextmanager
