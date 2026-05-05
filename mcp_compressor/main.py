@@ -451,16 +451,37 @@ async def _async_main(
         await uvicorn_server.serve()
     else:
         # Client mode: connect to pool, spawn backend, proxy tools
-        async with _client_mode(
-            port=server_port,
-            command_or_url_list=command_or_url_list,  # type: ignore[arg-type]  # validated non-None in main()
-            env_list=env_list,
-            compression_level=compression_level,
-            server_name=server_name,
-            toonify=toonify,
-        ) as mcp:
-            logger.info("Starting MCP Compressor client")
-            await mcp.run_async(show_banner=False, log_level=log_level.value)
+        # When lazy=True, bypass the pool and use standalone mode which supports
+        # lazy loading natively (serves cached tools, defers subprocess start).
+        if lazy:
+            async with _server(
+                command_or_url_list=command_or_url_list,  # type: ignore[arg-type]
+                cwd=cwd,
+                env_list=env_list,
+                header_list=header_list,
+                timeout=timeout,
+                compression_level=compression_level,
+                server_name=server_name,
+                toonify=toonify,
+                cli_mode=cli_mode,
+                cli_port=cli_port,
+                include_tools=include_tools,
+                exclude_tools=exclude_tools,
+                lazy=True,
+            ) as mcp:
+                logger.info("Starting MCP Compressor client (lazy standalone)")
+                await mcp.run_async(show_banner=False, log_level=log_level.value)
+        else:
+            async with _client_mode(
+                port=server_port,
+                command_or_url_list=command_or_url_list,  # type: ignore[arg-type]  # validated non-None in main()
+                env_list=env_list,
+                compression_level=compression_level,
+                server_name=server_name,
+                toonify=toonify,
+            ) as mcp:
+                logger.info("Starting MCP Compressor client")
+                await mcp.run_async(show_banner=False, log_level=log_level.value)
 
 
 @asynccontextmanager
