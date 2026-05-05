@@ -510,7 +510,7 @@ async def _server(
             yield mcp
         return
 
-    catalog_cache_key = _catalog_cache.make_cache_key(command_or_url, include_tools, exclude_tools) if lazy else None
+    catalog_cache_key = _catalog_cache.make_cache_key(command_or_url, include_tools, exclude_tools, server_name=server_name) if lazy else None
 
     logger.info("Initializing proxy server")
     async with _managed_proxy_client(transport, lazy=lazy) as client_manager:

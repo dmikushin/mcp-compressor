@@ -13,11 +13,11 @@ from fastmcp.utilities.types import Audio, File, Image
 class LogLevel(str, Enum):
     """Logging levels for the MCP Compressor server and wrapped MCP servers."""
 
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    CRITICAL = "CRITICAL"
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 
 class CompressionLevel(str, Enum):

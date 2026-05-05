@@ -4,6 +4,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+Environment=PATH=%h/.local/bin:%h/go/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 ExecStart=/usr/bin/mcp-compressor --server --server-port 9020
 Restart=always
 RestartSec=5

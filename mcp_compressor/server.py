@@ -32,9 +32,18 @@ from .tools import CompressedTools, ReloadableClientManager
 from .types import CompressionLevel
 
 
-def _make_backend_key(command: str, args: list[str]) -> str:
+def _make_backend_key(
+    command: str,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    server_name: str | None = None,
+) -> str:
     """Return a short deterministic key for a backend command."""
     payload = command + "|" + "|".join(args)
+    if env:
+        payload += "|" + "|".join(f"{k}={v}" for k, v in sorted(env.items()))
+    if server_name:
+        payload += "|name=" + server_name
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
@@ -79,7 +88,7 @@ class BackendPool:
         server_name: str | None = None,
     ) -> dict[str, Any]:
         """Spawn a backend (or return existing) and return its key + port."""
-        key = _make_backend_key(command, args)
+        key = _make_backend_key(command, args, env=env, server_name=server_name)
 
         async with self._lock:
             if key in self._backends:

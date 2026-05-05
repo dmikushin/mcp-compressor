@@ -24,9 +24,12 @@ def make_cache_key(
     command_or_url: str,
     include_tools: list[str] | None = None,
     exclude_tools: list[str] | None = None,
+    server_name: str | None = None,
 ) -> str:
     """Return a short stable hex key for the given backend configuration."""
     parts = [command_or_url]
+    if server_name:
+        parts.append("name:" + server_name)
     if include_tools:
         parts.append("include:" + ",".join(sorted(include_tools)))
     if exclude_tools:
