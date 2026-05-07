@@ -36,12 +36,19 @@ def _make_backend_key(
     command: str,
     args: list[str],
     env: dict[str, str] | None = None,
+    cwd: str | None = None,
     server_name: str | None = None,
 ) -> str:
-    """Return a short deterministic key for a backend command."""
+    """Return a short deterministic key for a backend command.
+
+    Two backends share a process iff (command, args, env, cwd, server_name) match.
+    cwd matters because backends often resolve project-relative files.
+    """
     payload = command + "|" + "|".join(args)
     if env:
         payload += "|" + "|".join(f"{k}={v}" for k, v in sorted(env.items()))
+    if cwd:
+        payload += "|cwd=" + cwd
     if server_name:
         payload += "|name=" + server_name
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -87,85 +94,149 @@ class BackendPool:
         compression_level: CompressionLevel = CompressionLevel.MEDIUM,
         server_name: str | None = None,
     ) -> dict[str, Any]:
-        """Spawn a backend (or return existing) and return its key + port."""
-        key = _make_backend_key(command, args, env=env, server_name=server_name)
+        """Spawn a backend (or return existing) and return its key + port.
+
+        On failure during construction, cleans up partial state so a retry can
+        succeed. Stats fetch happens outside the global lock to avoid blocking
+        other clients on a slow backend.
+        """
+        key = _make_backend_key(command, args, env=env, cwd=cwd, server_name=server_name)
 
         async with self._lock:
-            if key in self._backends:
-                logger.info(f"Backend {key!r} already running on port {self._backends[key].port}; reusing")
-                inst = self._backends[key]
+            inst = self._backends.get(key)
+            if inst is not None:
+                logger.info(f"Backend {key!r} already running on port {inst.port}; reusing")
             else:
-                port = _find_free_port()
-                logger.info(f"Spawning backend {key!r} on port {port}: {command} {' '.join(args)}")
-
-                transport = StdioTransport(command=command, args=args, env=env, cwd=cwd)
-
-                async def connect() -> ProxyClient:
-                    client = ProxyClient(transport=transport, init_timeout=None)
-                    await client.__aenter__()
-                    return client
-
-                client_manager = ReloadableClientManager(connect=connect)
-                await client_manager.start()
-
-                mcp = FastMCPProxy(client_factory=client_manager.get_client, name="MCP Compressor Proxy")
-
-                compressed_tools = CompressedTools(
-                    mcp,
+                inst = await self._build_backend(
+                    key=key,
+                    command=command,
+                    args=args,
+                    env=env,
+                    cwd=cwd,
                     compression_level=compression_level,
                     server_name=server_name,
-                    toonify=False,
-                    client_manager=client_manager,
-                )
-                await compressed_tools.configure_server()
-
-                # Start uvicorn for this backend's MCP endpoint
-                mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
-                config = uvicorn.Config(
-                    mcp_app,
-                    host="127.0.0.1",
-                    port=port,
-                    log_level=self._log_level,
-                )
-                uvicorn_server = uvicorn.Server(config)
-                serve_task = asyncio.create_task(uvicorn_server.serve())
-
-                inst = BackendInstance(
-                    port=port,
-                    client_manager=client_manager,
-                    compressed_tools=compressed_tools,
-                    mcp=mcp,
-                    server=uvicorn_server,
-                    serve_task=serve_task,
                 )
                 self._backends[key] = inst
 
-                # Wait for the server to actually start listening
-                for _ in range(50):
-                    await asyncio.sleep(0.05)
-                    if uvicorn_server.started:
-                        break
-
+        # Stats fetch is outside the lock: a slow backend must not block other spawns.
+        # If stats fail (e.g. backend died after start), evict and surface the error.
+        try:
             stats = await inst.compressed_tools.get_compression_stats()
-            return {
-                "backend_key": key,
-                "port": inst.port,
-                "tool_count": stats["original_tool_count"],
-            }
+        except Exception as exc:
+            logger.error(f"Backend {key!r} stats fetch failed; evicting: {exc}")
+            async with self._lock:
+                if self._backends.get(key) is inst:
+                    self._backends.pop(key, None)
+            await self._teardown(inst)
+            raise
+
+        return {
+            "backend_key": key,
+            "port": inst.port,
+            "tool_count": stats["original_tool_count"],
+        }
+
+    async def _build_backend(
+        self,
+        key: str,
+        command: str,
+        args: list[str],
+        env: dict[str, str] | None,
+        cwd: str | None,
+        compression_level: CompressionLevel,
+        server_name: str | None,
+    ) -> BackendInstance:
+        """Construct a fresh backend. On any failure, tear down partial state and re-raise."""
+        port = _find_free_port()
+        logger.info(f"Spawning backend {key!r} on port {port}: {command} {' '.join(args)}")
+
+        transport = StdioTransport(command=command, args=args, env=env, cwd=cwd)
+
+        async def connect() -> ProxyClient:
+            client = ProxyClient(transport=transport, init_timeout=None)
+            await client.__aenter__()
+            return client
+
+        client_manager: ReloadableClientManager | None = None
+        uvicorn_server: uvicorn.Server | None = None
+        serve_task: asyncio.Task[None] | None = None
+        try:
+            client_manager = ReloadableClientManager(connect=connect)
+            await client_manager.start()
+
+            mcp = FastMCPProxy(client_factory=client_manager.get_client, name="MCP Compressor Proxy")
+
+            compressed_tools = CompressedTools(
+                mcp,
+                compression_level=compression_level,
+                server_name=server_name,
+                toonify=False,
+                client_manager=client_manager,
+            )
+            await compressed_tools.configure_server()
+
+            mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
+            config = uvicorn.Config(
+                mcp_app,
+                host="127.0.0.1",
+                port=port,
+                log_level=self._log_level,
+            )
+            uvicorn_server = uvicorn.Server(config)
+            serve_task = asyncio.create_task(uvicorn_server.serve())
+
+            # Wait for the server to actually start listening. If it never starts,
+            # raise — do NOT register a dead backend in the pool.
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                if uvicorn_server.started:
+                    break
+                if serve_task.done():
+                    # serve() returned/crashed before signaling started
+                    serve_task.result()  # re-raise the underlying exception
+                    raise RuntimeError(f"Backend {key!r} uvicorn exited before startup")
+            else:
+                raise RuntimeError(f"Backend {key!r} failed to start within 2.5s on port {port}")
+
+            return BackendInstance(
+                port=port,
+                client_manager=client_manager,
+                compressed_tools=compressed_tools,
+                mcp=mcp,
+                server=uvicorn_server,
+                serve_task=serve_task,
+            )
+        except BaseException:
+            # Clean up whatever was successfully created before re-raising.
+            if uvicorn_server is not None:
+                uvicorn_server.should_exit = True
+            if serve_task is not None and not serve_task.done():
+                serve_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await serve_task
+            if client_manager is not None:
+                with contextlib.suppress(Exception):
+                    await client_manager.stop()
+            raise
+
+    async def _teardown(self, instance: BackendInstance) -> None:
+        """Stop one backend's uvicorn + client manager. Idempotent, swallows errors."""
+        instance.server.should_exit = True
+        if instance.serve_task and not instance.serve_task.done():
+            instance.serve_task.cancel()
+            with contextlib.suppress(BaseException):
+                await instance.serve_task
+        with contextlib.suppress(Exception):
+            await instance.client_manager.stop()
 
     async def close(self) -> None:
         """Stop all running backends."""
         async with self._lock:
-            for key, instance in list(self._backends.items()):
-                logger.info(f"Stopping backend {key!r} on port {instance.port}")
-                instance.server.should_exit = True
-                if instance.serve_task:
-                    instance.serve_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await instance.serve_task
-                with contextlib.suppress(Exception):
-                    await instance.client_manager.stop()
+            instances = list(self._backends.items())
             self._backends.clear()
+        for key, instance in instances:
+            logger.info(f"Stopping backend {key!r} on port {instance.port}")
+            await self._teardown(instance)
 
 
 def create_pool_app(pool: BackendPool) -> Starlette:

@@ -239,19 +239,11 @@ def main(
 
     if threading.current_thread() is threading.main_thread():
         if server_mode:
-            # In server mode, let uvicorn handle SIGTERM gracefully for systemd compatibility.
-            def _handle_interrupt_server(signum: int, frame: object) -> None:
-                logger.info("Server stopping (signal received)")
-                with contextlib.suppress(Exception):
-                    current = psutil.Process()
-                    for child in current.children(recursive=True):
-                        with contextlib.suppress(Exception):
-                            child.terminate()
-                # Let uvicorn's signal handler do the rest
-                raise KeyboardInterrupt
-
-            signal.signal(signal.SIGINT, _handle_interrupt_server)
-            signal.signal(signal.SIGTERM, _handle_interrupt_server)
+            # Server mode: do NOT install our own signal handlers. Uvicorn
+            # installs its own when serve() starts; they set should_exit=True
+            # so serve() returns cleanly, allowing the `finally` block in
+            # _async_main to call pool.close() for orderly backend teardown.
+            pass
         else:
             shutting_down = False
 
@@ -448,7 +440,14 @@ async def _async_main(
         config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level=log_level.value)
         uvicorn_server = uvicorn.Server(config)
         logger.info(f"MCP Compressor backend pool on http://127.0.0.1:{server_port}")
-        await uvicorn_server.serve()
+        try:
+            await uvicorn_server.serve()
+        finally:
+            # Tear down all spawned backends so stdio child processes don't
+            # outlive the daemon. Reachable on SIGTERM (uvicorn handles signal
+            # and returns from serve()) and on KeyboardInterrupt.
+            logger.info("Shutting down backend pool")
+            await pool.close()
     else:
         # Client mode: connect to pool, spawn backend, proxy tools
         # When lazy=True, bypass the pool and use standalone mode which supports

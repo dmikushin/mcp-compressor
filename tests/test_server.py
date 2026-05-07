@@ -21,9 +21,13 @@ from mcp_compressor.types import CompressionLevel
 
 
 class FakeTask:
-    """A mock asyncio.Task that is awaitable and supports .cancel()."""
+    """A mock asyncio.Task that is awaitable and supports .cancel() / .done()."""
+    def __init__(self):
+        self._done = False
     def cancel(self):
-        pass
+        self._done = True
+    def done(self):
+        return self._done
     def __await__(self):
         async def _noop():
             pass
@@ -45,6 +49,35 @@ class TestMakeBackendKey:
         key = _make_backend_key("npx", ["-y", "@anthropic/mcp-github"])
         assert len(key) == 12
         assert all(c in "0123456789abcdef" for c in key)
+
+    def test_different_env_different_key(self):
+        """Regression: backend key must include env (otherwise GITHUB_TOKEN=A and =B collide)."""
+        k1 = _make_backend_key("uvx", ["mcp-x"], env={"TOKEN": "A"})
+        k2 = _make_backend_key("uvx", ["mcp-x"], env={"TOKEN": "B"})
+        assert k1 != k2
+
+    def test_same_env_different_order_same_key(self):
+        """Env dict ordering must not affect the key — sorted internally."""
+        k1 = _make_backend_key("uvx", ["mcp-x"], env={"A": "1", "B": "2"})
+        k2 = _make_backend_key("uvx", ["mcp-x"], env={"B": "2", "A": "1"})
+        assert k1 == k2
+
+    def test_different_cwd_different_key(self):
+        """Regression: backend key must include cwd — same command in different cwd is a different backend."""
+        k1 = _make_backend_key("uvx", ["mcp-x"], cwd="/tmp/proj-a")
+        k2 = _make_backend_key("uvx", ["mcp-x"], cwd="/tmp/proj-b")
+        assert k1 != k2
+
+    def test_different_server_name_different_key(self):
+        k1 = _make_backend_key("uvx", ["mcp-x"], server_name="foo")
+        k2 = _make_backend_key("uvx", ["mcp-x"], server_name="bar")
+        assert k1 != k2
+
+    def test_no_env_vs_empty_env_same_key(self):
+        """An empty env dict should hash the same as no env (falsy)."""
+        k1 = _make_backend_key("uvx", ["mcp-x"])
+        k2 = _make_backend_key("uvx", ["mcp-x"], env={})
+        assert k1 == k2
 
 
 class TestFindFreePort:
@@ -193,6 +226,80 @@ class TestBackendPool:
         # CompressedTools was called with compression_level=CompressionLevel.HIGH
         call_kwargs = mock_ct_class.call_args[1]
         assert call_kwargs["compression_level"] == CompressionLevel.HIGH
+
+    @pytest.mark.asyncio
+    async def test_spawn_failure_does_not_register_backend(self, pool, mock_connect):
+        """Regression: if configure_server() fails, the partial backend must not be left in the pool."""
+        failing_tools = MagicMock()
+        failing_tools.configure_server = AsyncMock(side_effect=RuntimeError("boom"))
+
+        patches = self._mock_spawn_deps(mock_connect, failing_tools)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+
+            with pytest.raises(RuntimeError, match="boom"):
+                await pool.spawn("uvx", ["mcp-broken"])
+
+        # Pool must be empty — a retry should be possible.
+        assert len(pool._backends) == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_stats_failure_evicts_backend(self, pool, mock_connect):
+        """Regression: if get_compression_stats() fails (outside the lock), the backend is evicted."""
+        flaky_tools = MagicMock()
+        flaky_tools.configure_server = AsyncMock()
+        flaky_tools.get_compression_stats = AsyncMock(side_effect=RuntimeError("stats failed"))
+
+        patches = self._mock_spawn_deps(mock_connect, flaky_tools)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+
+            with pytest.raises(RuntimeError, match="stats failed"):
+                await pool.spawn("uvx", ["mcp-x"])
+
+        assert len(pool._backends) == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_startup_timeout_raises_no_orphan(self, pool, mock_connect, mock_compressed_tools):
+        """Regression: if uvicorn never reports started, raise — do not register a dead backend."""
+        patches = list(self._mock_spawn_deps(mock_connect, mock_compressed_tools))
+        # Override uvicorn.Server with one whose .started stays False.
+        dead_server = MagicMock()
+        dead_server.started = False
+        # Override the create_task too: serve_task must not be done() (otherwise we'd re-raise its result)
+        dead_task = FakeTask()
+        # Strip prior uvicorn.Server / create_task patches and inject our own.
+        patches = [
+            p for p in patches
+            if p.attribute not in ("Server", "create_task")
+        ]
+        patches.append(patch("mcp_compressor.server.uvicorn.Server", return_value=dead_server))
+        patches.append(patch("mcp_compressor.server.asyncio.create_task", return_value=dead_task))
+
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+
+            with pytest.raises(RuntimeError, match="failed to start"):
+                await pool.spawn("uvx", ["mcp-stuck"])
+
+        assert len(pool._backends) == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_different_cwd_different_backend(self, pool, mock_connect, mock_compressed_tools):
+        """Regression: cwd is part of the backend identity — same command in different cwd → different backend."""
+        patches = self._mock_spawn_deps(mock_connect, mock_compressed_tools)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+
+            r1 = await pool.spawn("uvx", ["mcp-x"], cwd="/tmp/a")
+            r2 = await pool.spawn("uvx", ["mcp-x"], cwd="/tmp/b")
+
+        assert r1["backend_key"] != r2["backend_key"]
+        assert len(pool._backends) == 2
 
 
 class TestCreatePoolApp:
