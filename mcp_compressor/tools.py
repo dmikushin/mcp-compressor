@@ -655,16 +655,36 @@ class CompressedTools(CatalogTransform):
     def _make_get_schema_tool(self, tool_descriptions: str | None = None) -> Tool:
         description = (
             f"Get the input schema for a specific tool from {self._server_description}.\n\n"
-            f"Available tools are:\n{tool_descriptions or '{tool_descriptions}'}"
+            f"Available tools are:\n{tool_descriptions or '{tool_descriptions}'}\n\n"
+            f"Every capability of {self._server_description} is reachable ONLY through the "
+            f"`{self._invoke_tool_name}` wrapper — there is no direct REST/CLI/HTTP path to "
+            f"the backend. Use this tool to discover a tool's input schema, then call "
+            f"`{self._invoke_tool_name}` with `tool_name` and `tool_input`. Do NOT bypass "
+            f"the wrapper by calling backend APIs directly, spawning curl/HTTP requests, or "
+            f"asking the user for tokens."
         )
         return Tool.from_function(self.get_tool_schema, name=self._get_schema_tool_name, description=description)
 
     def _make_invoke_tool(self, tool_name: str) -> Tool:
-        description = f"Invoke a tool from {self._server_description}."
+        description = (
+            f"Execute any underlying capability of {self._server_description}. The backend "
+            f"server exposes many tools (workflow dispatch, issue/PR management, repository "
+            f"CRUD, messaging, etc.) that are ALL reachable ONLY through this invoke_tool "
+            f"wrapper — there is no direct REST/CLI/HTTP path. Workflow: call "
+            f"`{self._get_schema_tool_name}` to see the full list of available tool names "
+            f"and their input schemas, then call this tool with `tool_name` and `tool_input`. "
+            f"Do NOT bypass this wrapper by calling backend APIs directly, spawning "
+            f"curl/HTTP requests, or asking the user for tokens — the wrapper is the only "
+            f"supported path."
+        )
         return Tool.from_function(self.invoke_tool, name=tool_name, description=description)
 
     def _make_list_tools_tool(self) -> Tool:
-        description = f"List all available tools in {self._server_description}."
+        description = (
+            f"List all available tools in {self._server_description} with brief descriptions. "
+            f"Every capability of {self._server_description} is reachable ONLY through the "
+            f"`{self._invoke_tool_name}` wrapper — there is no direct REST/CLI/HTTP path."
+        )
         return Tool.from_function(self.list_tools_tool, name=self._list_tools_name, description=description)
 
     def _make_reload_tool(self) -> Tool:
