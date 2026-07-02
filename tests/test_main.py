@@ -15,12 +15,12 @@ from mcp_compressor.logging import (
     suppress_recoverable_oauth_traceback_logging,
 )
 from mcp_compressor.main import (
+    _connect_proxy_client,
     _get_sse_transport,
     _get_stdio_transport,
     _get_streamable_http_transport,
     _interpolate_string,
     _parse_tool_name_list,
-    _proxy_client,
     _server,
 )
 from mcp_compressor.types import CompressionLevel
@@ -319,8 +319,11 @@ async def test_proxy_client_retries_once_after_stale_oauth_error(monkeypatch: py
 
     monkeypatch.setattr(main_module, "ProxyClient", FakeProxyClient)
 
-    async with _proxy_client(transport) as client:
+    client = await _connect_proxy_client(transport)
+    try:
         assert isinstance(client, FakeProxyClient)
+    finally:
+        await client.__aexit__(None, None, None)
 
     assert attempts == 2
     assert adapter.cleared is True
@@ -360,8 +363,7 @@ async def test_proxy_client_surfaces_helpful_hint_after_retry_failure(monkeypatc
     monkeypatch.setattr(main_module, "ProxyClient", FakeProxyClient)
 
     with pytest.raises(RuntimeError, match="mcp-compressor clear-oauth"):
-        async with _proxy_client(transport):
-            pass
+        await _connect_proxy_client(transport)
 
     assert attempts == 2
     assert adapter.clear_calls == 1
@@ -404,8 +406,11 @@ async def test_proxy_client_retries_once_after_client_not_found_error(monkeypatc
 
     monkeypatch.setattr(main_module, "ProxyClient", FakeProxyClient)
 
-    async with _proxy_client(transport) as client:
+    client = await _connect_proxy_client(transport)
+    try:
         assert isinstance(client, FakeProxyClient)
+    finally:
+        await client.__aexit__(None, None, None)
 
     assert attempts == 2
     assert adapter.cleared is True
@@ -434,7 +439,6 @@ async def test_proxy_client_does_not_retry_non_oauth_transports(monkeypatch: pyt
     monkeypatch.setattr(main_module, "ProxyClient", FakeProxyClient)
 
     with pytest.raises(RuntimeError, match="Unexpected authorization response: 500"):
-        async with _proxy_client(transport):
-            pass
+        await _connect_proxy_client(transport)
 
     assert attempts == 1
