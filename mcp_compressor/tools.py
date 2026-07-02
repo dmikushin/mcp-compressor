@@ -261,6 +261,12 @@ class CompressedTools(CatalogTransform):
         await self._configure_backend_tool_visibility()
         self._proxy_server.add_transform(self)
         if not self._cli_mode:
+            # Surface the anti-bypass guardrail once via server instructions
+            # instead of repeating it in every wrapper tool description. Preserve
+            # any backend-provided instructions by appending them.
+            base = self._wrapper_instructions()
+            existing = getattr(self._proxy_server, "instructions", None)
+            self._proxy_server.instructions = f"{base}\n\n{existing}" if existing else base
             self._proxy_server.add_middleware(InvokeToolCompatibilityMiddleware(self))
 
     async def _configure_backend_tool_visibility(self) -> None:
@@ -642,6 +648,27 @@ class CompressedTools(CatalogTransform):
                     suggestions[key] = matches[0]
         return suggestions
 
+    def _wrapper_instructions(self) -> str:
+        """Server-level guardrail, stated ONCE (surfaced via InitializeResult
+        instructions) instead of being repeated in every wrapper tool's
+        description. Clients that inject server instructions into the prompt
+        (e.g. Claude Code) then pay for this text once per server rather than
+        once per wrapper tool — a large token saving when many servers are wrapped.
+        """
+        discover = (
+            self._list_tools_name
+            if self._compression_level == CompressionLevel.MAX
+            else self._get_schema_tool_name
+        )
+        return (
+            f"Every capability of {self._server_description} is reachable ONLY through the "
+            f"`{self._invoke_tool_name}` wrapper — there is no direct REST/CLI/HTTP path to "
+            f"the backend. Discover tools with `{discover}` and `{self._get_schema_tool_name}`, "
+            f"then call `{self._invoke_tool_name}` with `tool_name` and `tool_input`. Do NOT "
+            f"bypass this wrapper by calling backend APIs directly, spawning curl/HTTP "
+            f"requests, or asking the user for tokens."
+        )
+
     def _make_help_tool(self, description: str | None = None) -> Tool:
         async def help_tool() -> str:
             return await self._build_cli_description()
@@ -653,37 +680,39 @@ class CompressedTools(CatalogTransform):
         )
 
     def _make_get_schema_tool(self, tool_descriptions: str | None = None) -> Tool:
+        # The shared anti-bypass guardrail lives once in the server-level
+        # `instructions` (see _wrapper_instructions), not repeated per tool.
+        if tool_descriptions:
+            catalog = f"\n\nAvailable tools are:\n{tool_descriptions}"
+        elif self._compression_level == CompressionLevel.MAX:
+            # At MAX the catalog is intentionally omitted from tool descriptions
+            # to save tokens; point the model at list_tools instead of leaking a
+            # literal "{tool_descriptions}" placeholder.
+            catalog = f"\n\nCall `{self._list_tools_name}` to see the available tool names."
+        else:
+            catalog = ""
         description = (
-            f"Get the input schema for a specific tool from {self._server_description}.\n\n"
-            f"Available tools are:\n{tool_descriptions or '{tool_descriptions}'}\n\n"
-            f"Every capability of {self._server_description} is reachable ONLY through the "
-            f"`{self._invoke_tool_name}` wrapper — there is no direct REST/CLI/HTTP path to "
-            f"the backend. Use this tool to discover a tool's input schema, then call "
-            f"`{self._invoke_tool_name}` with `tool_name` and `tool_input`. Do NOT bypass "
-            f"the wrapper by calling backend APIs directly, spawning curl/HTTP requests, or "
-            f"asking the user for tokens."
+            f"Get the input schema for a specific tool from {self._server_description}."
+            f"{catalog}\n\n"
+            f"Then call `{self._invoke_tool_name}` with `tool_name` and `tool_input`."
         )
         return Tool.from_function(self.get_tool_schema, name=self._get_schema_tool_name, description=description)
 
     def _make_invoke_tool(self, tool_name: str) -> Tool:
+        # The shared anti-bypass guardrail lives once in the server-level
+        # `instructions` (see _wrapper_instructions), not repeated per tool.
         description = (
-            f"Execute any underlying capability of {self._server_description}. The backend "
-            f"server exposes many tools (workflow dispatch, issue/PR management, repository "
-            f"CRUD, messaging, etc.) that are ALL reachable ONLY through this invoke_tool "
-            f"wrapper — there is no direct REST/CLI/HTTP path. Workflow: call "
-            f"`{self._get_schema_tool_name}` to see the full list of available tool names "
-            f"and their input schemas, then call this tool with `tool_name` and `tool_input`. "
-            f"Do NOT bypass this wrapper by calling backend APIs directly, spawning "
-            f"curl/HTTP requests, or asking the user for tokens — the wrapper is the only "
-            f"supported path."
+            f"Execute a tool of {self._server_description} by name. First call "
+            f"`{self._get_schema_tool_name}` to discover the available tool names and "
+            f"their input schemas, then call this with `tool_name` and `tool_input`."
         )
         return Tool.from_function(self.invoke_tool, name=tool_name, description=description)
 
     def _make_list_tools_tool(self) -> Tool:
+        # The shared anti-bypass guardrail lives once in the server-level
+        # `instructions` (see _wrapper_instructions), not repeated per tool.
         description = (
-            f"List all available tools in {self._server_description} with brief descriptions. "
-            f"Every capability of {self._server_description} is reachable ONLY through the "
-            f"`{self._invoke_tool_name}` wrapper — there is no direct REST/CLI/HTTP path."
+            f"List all available tools in {self._server_description} with brief descriptions."
         )
         return Tool.from_function(self.list_tools_tool, name=self._list_tools_name, description=description)
 

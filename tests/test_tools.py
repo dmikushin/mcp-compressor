@@ -827,3 +827,59 @@ async def test_on_call_tool_extracts_flat_args_as_tool_input(proxy_mcp_client) -
     )
     assert result.content
     assert result.content[0].text == "8"
+
+
+class _FakeProxyForInstructions:
+    """Minimal proxy double exposing the FastMCP `instructions` attribute."""
+
+    def __init__(self) -> None:
+        self.instructions: str | None = None
+        self.middleware: list[object] = []
+        self.transforms: list[object] = []
+        self.tools: list = []
+
+    def add_middleware(self, m) -> None:
+        self.middleware.append(m)
+
+    def add_transform(self, t) -> None:
+        self.transforms.append(t)
+
+    async def list_tools(self, *, run_middleware: bool = True):
+        return self.tools
+
+
+async def test_guardrail_moved_to_server_instructions() -> None:
+    """The anti-bypass guardrail must live once in server instructions, not be
+    repeated in every wrapper tool description, and get_tool_schema at MAX must
+    not leak the literal `{tool_descriptions}` placeholder."""
+    proxy = _FakeProxyForInstructions()
+    ct = CompressedTools(proxy, CompressionLevel.MAX, server_name="demo")
+
+    await ct.configure_server()
+
+    # Guardrail is stated once, in server instructions.
+    assert proxy.instructions is not None
+    assert "Do NOT" in proxy.instructions
+    assert "demo" in proxy.instructions
+    assert ct._invoke_tool_name in proxy.instructions
+
+    # Wrapper tool descriptions no longer repeat the anti-bypass paragraph.
+    schema_tool = ct._make_get_schema_tool()  # None tool_descriptions -> MAX branch
+    invoke_tool = ct._make_invoke_tool(ct._invoke_tool_name)
+    assert "{tool_descriptions}" not in schema_tool.description
+    assert "Do NOT bypass" not in schema_tool.description
+    assert "Do NOT bypass" not in invoke_tool.description
+    # At MAX the schema tool points the model at list_tools instead of a catalog.
+    assert ct._list_tools_name in schema_tool.description
+
+
+async def test_existing_backend_instructions_are_preserved() -> None:
+    """Backend-provided instructions must be kept, with the guardrail prepended."""
+    proxy = _FakeProxyForInstructions()
+    proxy.instructions = "Backend says hello."
+    ct = CompressedTools(proxy, CompressionLevel.MAX, server_name="demo")
+
+    await ct.configure_server()
+
+    assert "Backend says hello." in proxy.instructions
+    assert "Do NOT" in proxy.instructions
