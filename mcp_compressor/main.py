@@ -217,6 +217,21 @@ def main(
             help="Port for the server daemon to listen on, or for the client to connect to.",
         ),
     ] = 9020,
+    mcp_config: Annotated[
+        str | None,
+        typer.Option(
+            ...,
+            "--mcp-config",
+            help=(
+                "Front the entire estate: read a client's MCP configuration (a file with an "
+                "mcpServers object, e.g. ~/.claude.json) and expose ONE compressed interface over "
+                "every server in it — catalog, get_tool_schema, invoke_tool, reload. "
+                "Replaces one wrapper process per server. Backends start on first invocation; "
+                "the catalog is served from disk and starts nothing. "
+                "COMMAND_OR_URL must not be given with this."
+            ),
+        ),
+    ] = None,
 ):
     """Run the MCP Compressor proxy server.
 
@@ -226,14 +241,20 @@ def main(
     configure_logging(log_level)
 
     # Validate mode flags
-    if not server_mode and not command_or_url_list:
+    if mcp_config and command_or_url_list:
+        raise typer.BadParameter(
+            "--mcp-config fronts every server in the configuration; a single "
+            "COMMAND_OR_URL cannot also be given.",
+            param_hint="'COMMAND_OR_URL'",
+        )
+    if not server_mode and not mcp_config and not command_or_url_list:
         raise typer.BadParameter(
             "COMMAND_OR_URL is required in client mode.", param_hint="'COMMAND_OR_URL'"
         )
 
     if cli_mode and server_name is None:
         raise typer.BadParameter("--server-name is required when using --cli-mode.", param_hint="'--server-name'")
-    if compression_level == CompressionLevel.MAX and server_name is None:
+    if compression_level == CompressionLevel.MAX and server_name is None and not mcp_config:
         raise typer.BadParameter(
             "--server-name is required when using --compression-level=max.", param_hint="'--server-name'"
         )
@@ -286,6 +307,7 @@ def main(
             lazy=lazy,
             server_mode=server_mode,
             server_port=server_port,
+            mcp_config=mcp_config,
         )
     )
 
@@ -493,11 +515,25 @@ async def _async_main(
     lazy: bool = False,
     server_mode: bool = False,
     server_port: int = 9020,
+    mcp_config: str | None = None,
 ) -> None:
     """Run the MCP Compressor proxy server asynchronously."""
     logger.info(f"Starting MCP Compressor with log level: {log_level.value}")
 
-    if server_mode:
+    if mcp_config:
+        from .estate import load_servers
+        from .estate_server import Estate, build_estate_server
+
+        specs = load_servers(mcp_config)
+        logger.info(f"Estate mode: {len(specs)} server(s) from {mcp_config}")
+        estate = Estate(specs, compression_level=compression_level)
+        try:
+            await build_estate_server(estate).run_async(show_banner=False)
+        finally:
+            # Backends are stdio children; without this they outlive the front
+            # end as orphans holding whatever the tools were holding.
+            await estate.close()
+    elif server_mode:
         from .server import BackendPool, create_pool_app
 
         pool = BackendPool(log_level=log_level.value)
