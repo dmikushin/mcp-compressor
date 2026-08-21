@@ -45,6 +45,7 @@ from .banner import print_banner
 from .cli_bridge import CliBridge
 from .cli_script import generate_cli_script, remove_cli_script_entry
 from .cli_tools import sanitize_cli_name
+from .estate import DEFAULT_MCP_CONFIG
 from .logging import configure_logging, suppress_recoverable_oauth_traceback_logging
 from .tools import CompressedTools, ReloadableClientManager
 from .types import CompressionLevel, LogLevel, TransportType
@@ -223,20 +224,19 @@ def main(
             ...,
             "--mcp-config",
             help=(
-                "Front the entire estate: read a client's MCP configuration (a file with an "
-                "mcpServers object, e.g. ~/.claude.json) and expose ONE compressed interface over "
-                "every server in it — catalog, get_tool_schema, invoke_tool, reload. "
-                "Replaces one wrapper process per server. Backends start on first invocation; "
-                "the catalog is served from disk and starts nothing. "
-                "COMMAND_OR_URL must not be given with this."
+                "Path to the client MCP configuration to front. Only needed to override the "
+                f"default, {DEFAULT_MCP_CONFIG}."
             ),
         ),
     ] = None,
 ):
     """Run the MCP Compressor proxy server.
 
-    This is the main entry point for the CLI application. It connects to an MCP server
-    (via stdio, HTTP, or SSE) and wraps it with a compressed tool interface.
+    With a COMMAND_OR_URL it wraps that one server. With none — the usual way to
+    run it — it fronts the whole estate: it reads the client's own MCP
+    configuration and exposes four tools over every server in it (catalog,
+    get_tool_schema, invoke_tool, reload), starting a backend only when one is
+    actually called.
     """
     configure_logging(log_level)
 
@@ -247,10 +247,10 @@ def main(
             "COMMAND_OR_URL cannot also be given.",
             param_hint="'COMMAND_OR_URL'",
         )
-    if not server_mode and not mcp_config and not command_or_url_list:
-        raise typer.BadParameter(
-            "COMMAND_OR_URL is required in client mode.", param_hint="'COMMAND_OR_URL'"
-        )
+    # No backend named and not the pool daemon: front the estate.
+    estate_mode = not server_mode and not command_or_url_list
+    if estate_mode and not mcp_config:
+        mcp_config = DEFAULT_MCP_CONFIG
 
     if cli_mode and server_name is None:
         raise typer.BadParameter("--server-name is required when using --cli-mode.", param_hint="'--server-name'")

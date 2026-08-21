@@ -31,6 +31,12 @@ from typing import Any
 
 COMPRESSOR_COMMAND_NAMES = ("mcp-compressor",)
 
+#: Where a client's MCP configuration lives unless told otherwise. The
+#: compressor reads it itself rather than being handed a server list, so that
+#: adding a server to the client's config is all it takes for the estate to
+#: include it — no second place to keep in step.
+DEFAULT_MCP_CONFIG = "~/.claude.json"
+
 
 class ConfigError(RuntimeError):
     """The configuration could not be read. The message names the file."""
