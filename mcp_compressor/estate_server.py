@@ -142,17 +142,39 @@ class Estate:
         except KeyError:
             raise UnknownServer(server, self.names) from None
 
-    def catalog(self, server: str | None = None) -> str:
-        """Tool names, grouped by server. Starts nothing.
+    async def catalog(self, server: str | None = None) -> str:
+        """Tool names, grouped by server.
 
-        Servers that are configured but have no catalog are listed too. They are
-        the ones that have never successfully run, and saying so is the whole
-        point: for as long as this was silent, four broken servers on this
-        machine were invisible to everyone, including their owner.
+        Asked for the whole estate, this starts nothing: it reads the catalogs
+        ``--lazy`` already wrote. Servers with no catalog are named as such
+        rather than omitted — for as long as that was silent, four broken
+        servers on this machine were invisible to everyone, including their
+        owner.
+
+        Asked for ONE server that has never been indexed, it starts that server
+        once and indexes it. Without this the estate deadlocks: a backend is
+        started on first invocation, an invocation needs a tool name, and a tool
+        name comes from a catalog the backend has not written yet. So a server
+        added to the configuration could never become visible. Naming a server
+        is a deliberate act, which is what makes it a safe place to spend a
+        subprocess; asking for everything is not, and does not.
         """
-        wanted = [server] if server is not None else self.names
         if server is not None and server not in self._backends:
             raise UnknownServer(server, self.names)
+        wanted = [server] if server is not None else self.names
+
+        if server is not None and _catalog_cache.load_entry(
+            self._backends[server].cache_key
+        ) is None:
+            logger.info(f"Catalog requested for unindexed server {server!r}; indexing it.")
+            try:
+                await self._backends[server].tools()
+            except Exception as exc:
+                return (
+                    f"{server} could not be indexed: {exc}\n"
+                    "The server is configured but does not start, so its tools "
+                    "are unknown. Fix the server, then ask for it again."
+                )
 
         lines: list[str] = []
         unindexed: list[str] = []
@@ -176,8 +198,8 @@ class Estate:
             out.extend(lines)
         if unindexed:
             out.append(
-                "Configured but never indexed (the server has not started successfully, "
-                f"so its tools are unknown): {', '.join(unindexed)}"
+                "Configured but never indexed — ask for one by name to index it "
+                f"(catalog with server=<name>): {', '.join(unindexed)}"
             )
         if not out:
             return "No servers configured."
@@ -214,14 +236,17 @@ def build_estate_server(estate: Estate, name: str = "MCP Compressor Estate") -> 
     mcp: FastMCP = FastMCP(name=name)
 
     @mcp.tool()
-    def catalog(server: str | None = None) -> str:
+    async def catalog(server: str | None = None) -> str:
         """List the tool names of every configured MCP server, or of one server.
 
         Names only, no descriptions and no schemas. Start here: find the tool you
-        need, then call get_tool_schema for its real API. No server is started to
-        answer this.
+        need, then call get_tool_schema for its real API.
+
+        Asking for everything starts nothing. Asking for ONE server that has
+        never been indexed starts it once, so that a server newly added to the
+        configuration can become visible at all.
         """
-        return estate.catalog(server)
+        return await estate.catalog(server)
 
     @mcp.tool()
     async def get_tool_schema(server: str, tool: str) -> str:

@@ -15,19 +15,19 @@ def spec(name: str, command: str = "some-backend") -> ServerSpec:
 
 
 class TestCatalog:
-    def test_lists_names_grouped_by_server(self, tmp_path, monkeypatch) -> None:
+    async def test_lists_names_grouped_by_server(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("github"), spec("zulip")])
         for name, tools in (("github", ["create_issue", "list_prs"]), ("zulip", ["send_message"])):
             key = estate._backend(name).cache_key
             cc.save(key, [{"name": t} for t in tools], server=name)
 
-        out = estate.catalog()
+        out = await estate.catalog()
         assert "github (2): create_issue, list_prs" in out
         assert "zulip (1): send_message" in out
         assert "3 tools across 2 servers" in out
 
-    def test_says_nothing_about_schemas(self, tmp_path, monkeypatch) -> None:
+    async def test_says_nothing_about_schemas(self, tmp_path, monkeypatch) -> None:
         # The whole saving is that descriptions and schemas stay out of it.
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("github")])
@@ -36,53 +36,110 @@ class TestCatalog:
             [{"name": "create_issue", "description": "SHOULD NOT APPEAR", "inputSchema": {"a": 1}}],
             server="github",
         )
-        out = estate.catalog()
+        out = await estate.catalog()
         assert "create_issue" in out
         assert "SHOULD NOT APPEAR" not in out
         assert "inputSchema" not in out
 
-    def test_reports_configured_servers_that_never_indexed(self, tmp_path, monkeypatch) -> None:
+    async def test_reports_configured_servers_that_never_indexed(self, tmp_path, monkeypatch) -> None:
         # Four servers on this machine were broken and invisible for exactly as
         # long as this was silent.
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("working"), spec("broken")])
         cc.save(estate._backend("working").cache_key, [{"name": "t"}], server="working")
 
-        out = estate.catalog()
+        out = await estate.catalog()
         assert "working (1): t" in out
         assert "Configured but never indexed" in out
         assert "broken" in out.split("Configured but never indexed")[1]
 
-    def test_starts_no_backend(self, tmp_path, monkeypatch) -> None:
+    async def test_starts_no_backend(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("github")])
         cc.save(estate._backend("github").cache_key, [{"name": "t"}], server="github")
-        estate.catalog()
+        await estate.catalog()
         assert not estate._backend("github").is_started, "catalog must never launch a subprocess"
 
-    def test_one_server_can_be_asked_for(self, tmp_path, monkeypatch) -> None:
+    async def test_one_server_can_be_asked_for(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("a"), spec("b")])
         cc.save(estate._backend("a").cache_key, [{"name": "ta"}], server="a")
         cc.save(estate._backend("b").cache_key, [{"name": "tb"}], server="b")
-        out = estate.catalog("a")
+        out = await estate.catalog("a")
         assert "ta" in out
         assert "tb" not in out
 
-    def test_an_empty_estate_says_so(self, tmp_path, monkeypatch) -> None:
+    async def test_an_empty_estate_says_so(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
-        assert Estate([]).catalog() == "No servers configured."
+        assert await Estate([]).catalog() == "No servers configured."
+
+
+class TestIndexingDeadlock:
+    """Backends start on first invocation; an invocation needs a tool name; a
+    tool name comes from a catalog the backend writes when it starts. A server
+    newly added to the configuration is outside that loop and would never become
+    visible. Naming one is the way in."""
+
+    async def test_asking_for_one_unindexed_server_indexes_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        estate = Estate([spec("fresh")])
+        started: list[str] = []
+
+        async def fake_tools():
+            started.append("fresh")
+            cc.save(
+                estate._backend("fresh").cache_key,
+                [{"name": "newly_found"}],
+                server="fresh",
+            )
+
+        monkeypatch.setattr(estate._backend("fresh"), "tools", fake_tools)
+        out = await estate.catalog("fresh")
+        assert started == ["fresh"], "the named server must be started once"
+        assert "newly_found" in out
+
+    async def test_asking_for_everything_still_starts_nothing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        estate = Estate([spec("a"), spec("b")])
+
+        async def explode():
+            raise AssertionError("a whole-estate catalog must not start anything")
+
+        for name in ("a", "b"):
+            monkeypatch.setattr(estate._backend(name), "tools", explode)
+        out = await estate.catalog()
+        assert "Configured but never indexed" in out
+
+    async def test_a_server_that_cannot_start_says_why(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Reporting the failure is the point: a silent empty catalog sends the
+        # model looking for tools that will never appear.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        estate = Estate([spec("broken")])
+
+        async def fail():
+            raise RuntimeError("no such binary")
+
+        monkeypatch.setattr(estate._backend("broken"), "tools", fail)
+        out = await estate.catalog("broken")
+        assert "could not be indexed" in out
+        assert "no such binary" in out
 
 
 class TestUnknownServer:
     """A model that guessed a name needs the list of real ones more than it
     needs to be told it was wrong."""
 
-    def test_catalog_of_an_unknown_server_lists_the_known_ones(self, tmp_path, monkeypatch) -> None:
+    async def test_catalog_of_an_unknown_server_lists_the_known_ones(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
         estate = Estate([spec("github"), spec("zulip")])
         with pytest.raises(UnknownServer, match="github, zulip"):
-            estate.catalog("guthib")
+            await estate.catalog("guthib")
 
     async def test_get_tool_schema_of_an_unknown_server(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
