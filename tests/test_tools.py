@@ -1,5 +1,7 @@
 """Tests for mcp_compressor/tools.py."""
 
+import json
+
 import pytest
 import toons
 from fastmcp.tools import Tool
@@ -314,8 +316,63 @@ async def test_invalidate_tool_cache_forces_refetch() -> None:
     assert compressed_tools._cached_backend_tools is not original_cache
 
 
+async def test_lazy_start_attributes_a_legacy_catalog_without_connecting(
+    tmp_path, monkeypatch
+) -> None:
+    """A cache written before the envelope must gain its server name on the next
+    lazy start, without the backend being started.
+
+    This is the only moment it can happen. Lazy mode skips the connection when
+    the cache hits, and the connection is what used to rewrite the file — so
+    without this the name would never be recorded, and `mcp-compressor catalog`
+    could never say which server those tools belong to. That is not academic:
+    every catalog already on a live machine is in this state.
+    """
+    import json as _json
+
+    from fastmcp import FastMCP
+    from fastmcp.server import create_proxy
+
+    import mcp_compressor.catalog_cache as cc
+
+    cache_dir = tmp_path / "catalogs"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setattr(cc, "_CACHE_DIR", cache_dir)
+    (cache_dir / "legacykey.json").write_text(
+        _json.dumps([{"name": "old_tool", "description": "d", "inputSchema": {}}])
+    )
+
+    class NeverConnects:
+        """Fails the test if the backend is started at all."""
+
+        is_connected = False
+
+        async def ensure_connected(self) -> None:
+            raise AssertionError("lazy start must not connect when the cache hits")
+
+    backend = FastMCP(name="backend")
+    proxy_server = create_proxy(backend, name="proxy")
+    compressed_tools = CompressedTools(
+        proxy_server,
+        CompressionLevel.MAX,
+        server_name="github",
+        client_manager=NeverConnects(),  # type: ignore[arg-type]
+        catalog_cache_key="legacykey",
+        catalog_source="docker run ghcr.io/github/github-mcp-server",
+    )
+
+    await compressed_tools._configure_backend_tool_visibility()
+
+    entry = cc.load_entry("legacykey")
+    assert entry is not None
+    assert entry.server == "github"
+    assert entry.command == "docker run ghcr.io/github/github-mcp-server"
+    assert entry.tool_names == ["old_tool"], "the cached tools must survive the upgrade"
+    assert compressed_tools._cached_backend_tools is not None
+    assert set(compressed_tools._cached_backend_tools) == {"old_tool"}
+
+
 async def test_get_backend_tools_lazy_fetch_when_cache_cold() -> None:
-    """_get_backend_tools() should fetch from backend if cache is cold (configure_server not called)."""
     from fastmcp import FastMCP
     from fastmcp.server import create_proxy
     from fastmcp.server.context import Context
@@ -792,6 +849,63 @@ class TestCatalogCache:
         cc.save("mykey", tools)
         loaded = cc.load("mykey")
         assert loaded == tools
+
+    def test_save_records_the_server_it_came_from(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cc.save("k", [{"name": "foo"}], server="github", command="docker run ...")
+        entry = cc.load_entry("k")
+        assert entry is not None
+        assert entry.server == "github"
+        assert entry.command == "docker run ..."
+        assert entry.tool_names == ["foo"]
+
+    def test_a_bare_array_written_by_an_older_version_still_loads(self, tmp_path, monkeypatch) -> None:
+        # The 19 catalogs already on a live machine are bare arrays. Refusing
+        # them would silently drop every tool the user already has cached.
+        import mcp_compressor.catalog_cache as cc
+
+        cache_dir = tmp_path / "catalogs"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(cc, "_CACHE_DIR", cache_dir)
+        (cache_dir / "legacy.json").write_text(json.dumps([{"name": "old_tool"}]))
+        entry = cc.load_entry("legacy")
+        assert entry is not None
+        assert entry.server is None, "an old file cannot claim a server it never recorded"
+        assert entry.tool_names == ["old_tool"]
+
+    def test_entries_lists_every_catalog_sorted_by_server(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cc.save("k2", [{"name": "b"}], server="zulip")
+        cc.save("k1", [{"name": "a"}], server="github")
+        # Order must come from the configuration, not from the filesystem: a
+        # listing whose order depends on directory iteration is a listing that
+        # changes between runs for no reason.
+        assert [e.server for e in cc.entries()] == ["github", "zulip"]
+
+    def test_entries_keeps_unattributable_catalogs_visible(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        cache_dir = tmp_path / "catalogs"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(cc, "_CACHE_DIR", cache_dir)
+        (cache_dir / "legacy.json").write_text(json.dumps([{"name": "old_tool"}]))
+        cc.save("named", [{"name": "new_tool"}], server="github")
+        servers = [e.server for e in cc.entries()]
+        assert servers == ["github", None], "an unnamed catalog must not vanish from the listing"
+
+    def test_load_entry_returns_none_on_corrupt_file(self, tmp_path, monkeypatch) -> None:
+        import mcp_compressor.catalog_cache as cc
+
+        cache_dir = tmp_path / "catalogs"
+        cache_dir.mkdir(parents=True)
+        monkeypatch.setattr(cc, "_CACHE_DIR", cache_dir)
+        (cache_dir / "broken.json").write_text("{not json")
+        assert cc.load_entry("broken") is None
+        assert cc.entries() == []
 
     def test_clear_removes_cache(self, tmp_path, monkeypatch) -> None:
         import mcp_compressor.catalog_cache as cc

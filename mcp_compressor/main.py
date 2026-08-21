@@ -6,6 +6,7 @@ compresses their tool descriptions to reduce token consumption.
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -39,10 +40,10 @@ from key_value.aio.stores.filetree import (
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from loguru import logger
 
+from . import catalog_cache as _catalog_cache
 from .banner import print_banner
 from .cli_bridge import CliBridge
 from .cli_script import generate_cli_script, remove_cli_script_entry
-from . import catalog_cache as _catalog_cache
 from .cli_tools import sanitize_cli_name
 from .logging import configure_logging, suppress_recoverable_oauth_traceback_logging
 from .tools import CompressedTools, ReloadableClientManager
@@ -331,6 +332,70 @@ def clear_oauth(
         print("No stored OAuth credentials found.")
 
 
+catalog_app = typer.Typer(name="catalog", help="List cached tool names across every wrapped server.")
+
+
+@catalog_app.callback(invoke_without_command=True)
+def catalog(
+    server: Annotated[
+        str | None,
+        typer.Option("--server", "-s", help="Only this server."),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Machine-readable output."),
+    ] = False,
+) -> None:
+    """Print the tool names of every server whose catalog is cached on disk.
+
+    Names only — no descriptions, no schemas.  A client shows this to a model so
+    it can see what exists; the model then asks ``get_tool_schema`` for the one
+    tool it intends to call.  Paying for 600 full schemas to use one of them is
+    the cost this whole layer exists to avoid.
+
+    Nothing is connected and no backend is started: the answer comes from the
+    catalogs ``--lazy`` already wrote.  A server that has never been run once has
+    no cache entry and cannot appear here — that is reported rather than passed
+    over in silence, because a catalog that quietly omits a server is a catalog
+    that sends a model looking for tools it will never find.
+    """
+    entries = _catalog_cache.entries()
+    if server is not None:
+        entries = [e for e in entries if e.server == server]
+
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    {"server": e.server, "command": e.command, "tools": e.tool_names}
+                    for e in entries
+                ],
+                indent=2,
+            )
+        )
+        return
+
+    if not entries:
+        where = f" for server {server!r}" if server else ""
+        print(f"No cached catalogs{where} in {_catalog_cache._CACHE_DIR}.")
+        print("A server's catalog is written the first time it runs under --lazy.")
+        return
+
+    unnamed = 0
+    for entry in entries:
+        if entry.server is None:
+            unnamed += 1
+            continue
+        print(f"{entry.server} ({len(entry.tool_names)}):")
+        for name in entry.tool_names:
+            print(f"  {name}")
+    if unnamed:
+        print(
+            f"\n{unnamed} cached catalog(s) predate the server name being recorded "
+            "and cannot be attributed. They will be named once their server runs again."
+        )
+
+
 def _should_retry_stale_oauth_connect_error(exception: Exception, transport: TransportType) -> bool:
     """Return whether a connection error looks like a stale cached OAuth state issue."""
     if not isinstance(transport, StreamableHttpTransport | SSETransport):
@@ -546,6 +611,7 @@ async def _server(
             exclude_tools=exclude_tools,
             client_manager=client_manager,
             catalog_cache_key=catalog_cache_key,
+            catalog_source=command_or_url,
         )
 
         logger.info("Configuring compressed tools middleware")
@@ -901,12 +967,16 @@ def _get_stdio_transport(command: str, args: list[str], cwd: str | None, env_lis
 def entrypoint() -> None:
     """Main entrypoint for the mcp-compressor CLI.
 
-    Handles the 'clear-oauth' subcommand manually before delegating to the
-    main Typer app, so that 'mcp-compressor <url>' works without a subcommand.
+    Handles the 'clear-oauth' and 'catalog' subcommands manually before
+    delegating to the main Typer app, so that 'mcp-compressor <url>' works
+    without a subcommand.
     """
     if len(sys.argv) > 1 and sys.argv[1] == "clear-oauth":
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         clear_oauth_app()
+    elif len(sys.argv) > 1 and sys.argv[1] == "catalog":
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        catalog_app()
     else:
         app()
 

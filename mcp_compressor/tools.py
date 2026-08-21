@@ -23,7 +23,6 @@ from fastmcp.exceptions import ToolError
 from fastmcp.resources import Resource
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.server.providers.proxy import ProxyClient
 from fastmcp.server.transforms import GetResourceNext, GetToolNext
 from fastmcp.server.transforms.catalog import CatalogTransform
 from fastmcp.tools import Tool
@@ -211,10 +210,12 @@ class CompressedTools(CatalogTransform):
         exclude_tools: Sequence[str] | None = None,
         client_manager: ReloadableClientManager | None = None,
         catalog_cache_key: str | None = None,
+        catalog_source: str | None = None,
     ) -> None:
         super().__init__()
         self._proxy_server = proxy_server
         self._compression_level = compression_level
+        self._server_name = server_name
         self._tool_name_prefix = f"{server_name}_" if server_name else ""
         self._server_description = f"the {server_name} toolset" if server_name else "this toolset"
         self._toonify = toonify
@@ -224,6 +225,7 @@ class CompressedTools(CatalogTransform):
         self._exclude_tools = set(exclude_tools or [])
         self._client_manager = client_manager
         self._catalog_cache_key = catalog_cache_key
+        self._catalog_source = catalog_source
         self._cached_backend_tools: dict[str, Tool | CachedTool] | None = None
         self._tool_cache_lock: asyncio.Lock = asyncio.Lock()
         self._help_tool_name = sanitize_tool_name(f"{server_name}_help" if server_name else "help")
@@ -286,14 +288,28 @@ class CompressedTools(CatalogTransform):
             and not self._client_manager.is_connected
         )
         if lazy:
-            cached = _catalog_cache.load(self._catalog_cache_key)  # type: ignore[arg-type]
-            if cached is not None:
+            entry = _catalog_cache.load_entry(self._catalog_cache_key)  # type: ignore[arg-type]
+            if entry is not None:
+                cached = entry.tools
                 logger.info(
                     f"Lazy mode: loaded {len(cached)} tool(s) from disk cache "
                     f"(key={self._catalog_cache_key!r}); backend not started."
                 )
+                # A cache written before the envelope existed carries no server
+                # name, and lazy mode never reconnects on a hit — so without
+                # this the name would never be recorded and `catalog` could
+                # never attribute the entry. The reader knows the name; it
+                # upgrades the file in place, at no connection cost.
+                if entry.server is None and self._server_name:
+                    _catalog_cache.save(
+                        self._catalog_cache_key,  # type: ignore[arg-type]
+                        cached,
+                        server=self._server_name,
+                        command=self._catalog_source,
+                    )
+                    logger.debug(f"Attributed legacy catalog cache to server {self._server_name!r}.")
                 self._cached_backend_tools = {
-                    entry["name"]: CachedTool.from_mcp_dict(entry) for entry in cached
+                    entry_dict["name"]: CachedTool.from_mcp_dict(entry_dict) for entry_dict in cached
                 }
                 return
             # Cache miss in lazy mode → fall through and connect eagerly this time
@@ -455,7 +471,12 @@ class CompressedTools(CatalogTransform):
         """Persist the tool catalog to disk for future lazy-loading starts."""
         try:
             data = [t.to_mcp_tool().model_dump(mode="json") for t in tools]
-            _catalog_cache.save(self._catalog_cache_key, data)  # type: ignore[arg-type]
+            _catalog_cache.save(
+                self._catalog_cache_key,  # type: ignore[arg-type]
+                data,
+                server=self._server_name,
+                command=self._catalog_source,
+            )
             logger.debug(f"Saved {len(data)} tool(s) to catalog cache (key={self._catalog_cache_key!r})")
         except Exception as exc:
             logger.warning(f"Failed to save catalog cache: {exc}")
