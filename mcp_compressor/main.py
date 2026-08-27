@@ -18,7 +18,7 @@ import warnings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, overload
+from typing import Annotated, Any, Literal, overload
 
 import anyio
 import keyring
