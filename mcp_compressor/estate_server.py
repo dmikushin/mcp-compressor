@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -38,7 +39,7 @@ from fastmcp.tools.tool import ToolResult
 from loguru import logger
 
 from . import catalog_cache as _catalog_cache
-from .estate import ServerSpec
+from .estate import ConfigError, ServerSpec, load_servers
 from .tools import CompressedTools, ReloadableClientManager
 from .types import CompressionLevel
 
@@ -129,8 +130,11 @@ class Estate:
         self,
         specs: list[ServerSpec],
         compression_level: CompressionLevel = CompressionLevel.MAX,
+        config_path: str | Path | None = None,
     ) -> None:
         self._backends = {s.name: EstateBackend(s, compression_level) for s in specs}
+        self._compression_level = compression_level
+        self._config_path = config_path
 
     @property
     def names(self) -> list[str]:
@@ -142,8 +146,53 @@ class Estate:
         except KeyError:
             raise UnknownServer(server, self.names) from None
 
+    async def rescan(self) -> list[str]:
+        """Bring the estate back in line with the configuration file.
+
+        Adding a server to the configuration used to require restarting the
+        client, because the estate was built once at startup and never looked
+        at the file again. Nothing about a backend is expensive until it is
+        called, so there is no reason to make anyone pay a restart to learn a
+        name: a spec is a few strings, and the subprocess still waits for a
+        deliberate first use.
+
+        Backends already running are left strictly alone unless their spec
+        actually changed, since restarting them would drop live connections and
+        discard their catalogs for no gain.
+        """
+        if self._config_path is None:
+            return []
+
+        wanted = {s.name: s for s in load_servers(self._config_path)}
+        changed: list[str] = []
+
+        for name in sorted(set(self._backends) - set(wanted)):
+            await self._backends.pop(name).stop()
+            changed.append(f"removed {name}")
+
+        for name, spec in wanted.items():
+            current = self._backends.get(name)
+            if current is None:
+                self._backends[name] = EstateBackend(spec, self._compression_level)
+                changed.append(f"added {name}")
+            elif current.spec != spec:
+                # The command itself changed, so a running child is now the
+                # wrong program; drop it and let the next call start the right one.
+                await current.stop()
+                self._backends[name] = EstateBackend(spec, self._compression_level)
+                changed.append(f"reconfigured {name}")
+
+        if changed:
+            logger.info(f"Rescan of {self._config_path}: {', '.join(changed)}")
+        return changed
+
     async def catalog(self, server: str | None = None) -> str:
         """Tool names, grouped by server.
+
+        Every call re-reads the configuration first. Discovery is exactly the
+        moment a name that was added since startup has to become visible, and
+        the read costs one small file, so there is nothing to be gained by
+        making the caller ask for it separately.
 
         Asked for the whole estate, this starts nothing: it reads the catalogs
         ``--lazy`` already wrote. Servers with no catalog are named as such
@@ -159,6 +208,14 @@ class Estate:
         is a deliberate act, which is what makes it a safe place to spend a
         subprocess; asking for everything is not, and does not.
         """
+        stale = ""
+        try:
+            await self.rescan()
+        except ConfigError as exc:
+            # A half-written config must not blind the estate to the servers it
+            # already knows; say what happened and answer from what we have.
+            stale = f"Configuration could not be re-read, so this list may be stale: {exc}"
+
         if server is not None and server not in self._backends:
             raise UnknownServer(server, self.names)
         wanted = [server] if server is not None else self.names
@@ -189,6 +246,8 @@ class Estate:
             lines.append(f"{name} ({len(names)}): {', '.join(names)}")
 
         out: list[str] = []
+        if stale:
+            out.append(stale)
         if lines:
             out.append(
                 f"{total} tools across {len(lines)} servers. Names only — call "
@@ -241,6 +300,9 @@ def build_estate_server(estate: Estate, name: str = "MCP Compressor Estate") -> 
 
         Names only, no descriptions and no schemas. Start here: find the tool you
         need, then call get_tool_schema for its real API.
+
+        The configuration is re-read on every call, so a server added to it
+        since this process started is listed here without restarting anything.
 
         Asking for everything starts nothing. Asking for ONE server that has
         never been indexed starts it once, so that a server newly added to the

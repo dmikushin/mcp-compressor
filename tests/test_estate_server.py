@@ -205,3 +205,79 @@ class TestCompressionLevel:
     def test_backends_are_built_at_the_level_the_estate_was_given(self) -> None:
         estate = Estate([spec("x")], compression_level=CompressionLevel.LOW)
         assert estate._backend("x")._compression_level is CompressionLevel.LOW
+
+
+class TestRescan:
+    """Adding a server to the configuration must not require a restart."""
+
+    @staticmethod
+    def write_config(path, **servers) -> str:
+        path.write_text(json.dumps({"mcpServers": {
+            name: {"command": command} for name, command in servers.items()
+        }}))
+        return str(path)
+
+    async def test_a_server_added_after_startup_becomes_visible(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cfg = tmp_path / "claude.json"
+        self.write_config(cfg, github="gh-backend")
+        estate = Estate([spec("github", "gh-backend")], config_path=cfg)
+
+        self.write_config(cfg, github="gh-backend", telegram="tg-backend")
+        assert "telegram" not in estate.names
+        await estate.catalog()
+        assert "telegram" in estate.names
+
+    async def test_a_server_removed_from_the_config_disappears(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cfg = tmp_path / "claude.json"
+        self.write_config(cfg, github="gh-backend", zulip="zulip-backend")
+        estate = Estate([spec("github", "gh-backend"), spec("zulip", "zulip-backend")], config_path=cfg)
+
+        self.write_config(cfg, github="gh-backend")
+        await estate.catalog()
+        assert estate.names == ["github"]
+
+    async def test_an_untouched_server_keeps_its_backend(self, tmp_path, monkeypatch) -> None:
+        # Rescanning must not quietly restart backends: a replaced object is a
+        # dropped subprocess and a discarded catalog.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cfg = tmp_path / "claude.json"
+        self.write_config(cfg, github="gh-backend")
+        estate = Estate([spec("github", "gh-backend")], config_path=cfg)
+        before = estate._backend("github")
+
+        self.write_config(cfg, github="gh-backend", telegram="tg-backend")
+        await estate.rescan()
+        assert estate._backend("github") is before
+
+    async def test_a_changed_command_replaces_the_backend(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cfg = tmp_path / "claude.json"
+        self.write_config(cfg, github="gh-backend")
+        estate = Estate([spec("github", "gh-backend")], config_path=cfg)
+        before = estate._backend("github")
+
+        self.write_config(cfg, github="gh-backend-v2")
+        assert await estate.rescan() == ["reconfigured github"]
+        assert estate._backend("github") is not before
+        assert estate._backend("github").spec.command == "gh-backend-v2"
+
+    async def test_an_unreadable_config_keeps_the_known_servers(self, tmp_path, monkeypatch) -> None:
+        # A config caught mid-write must not blind the estate to what it has.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        cfg = tmp_path / "claude.json"
+        self.write_config(cfg, github="gh-backend")
+        estate = Estate([spec("github", "gh-backend")], config_path=cfg)
+        cc.save(estate._backend("github").cache_key, [{"name": "create_issue"}], server="github")
+
+        cfg.write_text("{ this is not json")
+        out = await estate.catalog()
+        assert "create_issue" in out
+        assert "may be stale" in out
+
+    async def test_without_a_config_path_nothing_is_rescanned(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        estate = Estate([spec("github")])
+        assert await estate.rescan() == []
+        assert estate.names == ["github"]

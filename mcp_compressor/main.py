@@ -526,7 +526,7 @@ async def _async_main(
 
         specs = load_servers(mcp_config)
         logger.info(f"Estate mode: {len(specs)} server(s) from {mcp_config}")
-        estate = Estate(specs, compression_level=compression_level)
+        estate = Estate(specs, compression_level=compression_level, config_path=mcp_config)
         try:
             await build_estate_server(estate).run_async(show_banner=False)
         finally:
