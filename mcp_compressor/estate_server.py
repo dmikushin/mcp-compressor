@@ -32,6 +32,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import psutil
 from fastmcp import FastMCP
 from fastmcp.client.transports import StdioTransport
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
@@ -42,6 +43,19 @@ from . import catalog_cache as _catalog_cache
 from .estate import ConfigError, ServerSpec, load_servers
 from .tools import CompressedTools, ReloadableClientManager
 from .types import CompressionLevel
+
+
+def _own_child_pids() -> set[int]:
+    """PIDs of our direct children.
+
+    Backends are stdio subprocesses of this process, so a diff across a
+    restart says which one died and which one replaced it. Other backends are
+    untouched and cancel out of the diff.
+    """
+    try:
+        return {child.pid for child in psutil.Process().children()}
+    except Exception:  # pragma: no cover - psutil failing is not a reload error
+        return set()
 
 
 class UnknownServer(ValueError):
@@ -60,6 +74,7 @@ class EstateBackend:
         self._compression_level = compression_level
         self._tools: CompressedTools | None = None
         self._manager: ReloadableClientManager | None = None
+        self._transport: StdioTransport | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -113,14 +128,41 @@ class EstateBackend:
                 raise
             self._manager = manager
             self._tools = compressed
+            self._transport = transport
             return compressed
 
     async def stop(self) -> None:
         if self._manager is not None:
             with contextlib.suppress(Exception):
                 await self._manager.stop()
+        # Closing the session is not enough. StdioTransport defaults to
+        # keep_alive=True, which deliberately leaves the subprocess running
+        # between connections, and a later connect() on the same transport
+        # returns early because _connect_task is still set - so the process is
+        # neither replaced nor reused-from-scratch. disconnect() is the only
+        # thing that actually takes it down.
+        if self._transport is not None:
+            with contextlib.suppress(Exception):
+                await self._transport.disconnect()
         self._manager = None
         self._tools = None
+        self._transport = None
+
+    async def restart(self) -> CompressedTools:
+        """Take the backend down and bring it back up, for real.
+
+        stop() alone is not enough to make the next call use new code: the
+        estate is lazy, and a warm catalog cache lets tools() rebuild the
+        wrapper without ever connecting to anything. Reload is asked for
+        precisely when the code on disk has changed, so the connection is
+        forced here instead of being deferred to whenever something next
+        happens to call this server.
+        """
+        await self.stop()
+        tools = await self.tools()
+        if self._manager is not None:
+            await self._manager.ensure_connected()
+        return tools
 
 
 class Estate:
@@ -283,7 +325,27 @@ class Estate:
             # Reloading something that was never started is a no-op dressed as
             # an action; say so rather than starting it as a side effect.
             return f"Server {server!r} is not running; nothing to reload."
-        return await (await backend.tools()).reload_backend()
+
+        # Recycling the client session is not a restart: the transport keeps
+        # the subprocess alive, so the old code stays in memory and the caller
+        # is told it was reloaded. Tear the backend down and build it again,
+        # then prove the process changed instead of asserting that it did.
+        before = _own_child_pids()
+        tools = await backend.restart()
+        after = _own_child_pids()
+
+        died, born = sorted(before - after), sorted(after - before)
+        if not born:
+            raise RuntimeError(
+                f"Reload of {server!r} did not start a new backend process "
+                f"(children before: {sorted(before)}, after: {sorted(after)}). "
+                "The backend was left stopped."
+            )
+        catalog = await tools.get_backend_tools()
+        return (
+            f"Restarted {server!r}: pid {died[0] if died else '?'} -> {born[0]}, "
+            f"{len(catalog)} tools available."
+        )
 
     async def close(self) -> None:
         for backend in self._backends.values():
@@ -340,6 +402,9 @@ def build_estate_server(estate: Estate, name: str = "MCP Compressor Estate") -> 
 
         For a server whose code changed on disk, or one that has stopped
         answering. Servers that were never started are left alone.
+
+        The reply names the old and new process ids, because a restart that
+        silently did not happen is the failure this tool is most prone to.
         """
         return await estate.reload(server)
 

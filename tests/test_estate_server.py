@@ -1,7 +1,9 @@
 """Tests for mcp_compressor/estate_server.py."""
 
 import json
+import sys
 
+import psutil
 import pytest
 
 from mcp_compressor import catalog_cache as cc
@@ -163,6 +165,40 @@ class TestReload:
         message = await estate.reload("github")
         assert "not running" in message
         assert not estate._backend("github").is_started
+
+    async def test_reload_replaces_the_subprocess(self, tmp_path, monkeypatch) -> None:
+        # The failure this guards against is silent: recycling the client
+        # session leaves StdioTransport's subprocess running (keep_alive
+        # defaults to True) and a later connect() on the same transport
+        # returns early, so the old code stays in memory while reload reports
+        # success. Only the pid can tell the difference.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        script = tmp_path / "probe_server.py"
+        script.write_text(
+            "from fastmcp import FastMCP\n"
+            "mcp = FastMCP('probe')\n"
+            "@mcp.tool()\n"
+            "def ping() -> str:\n"
+            "    return 'pong'\n"
+            "mcp.run()\n"
+        )
+        estate = Estate([ServerSpec(name="probe", command=sys.executable, args=[str(script)])])
+        try:
+            await estate.catalog("probe")
+            assert estate._backend("probe").is_started
+            before = {c.pid for c in psutil.Process().children()}
+
+            message = await estate.reload("probe")
+
+            after = {c.pid for c in psutil.Process().children()}
+            died, born = before - after, after - before
+            assert died, f"reload did not stop the old backend (before={before}, after={after})"
+            assert born, f"reload did not start a new backend (before={before}, after={after})"
+            # The reply must carry the evidence, not merely claim success.
+            assert str(next(iter(born))) in message
+            assert "Restarted" in message
+        finally:
+            await estate.close()
 
 
 class TestCacheKeyCompatibility:
