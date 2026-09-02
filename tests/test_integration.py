@@ -10,17 +10,19 @@ from mcp_compressor.main import _server
 from mcp_compressor.tools import QUIET_MODE_THRESHOLD
 from mcp_compressor.types import CompressionLevel
 
-expected_tools_2 = {"get_tool_schema", "invoke_tool"}
-expected_tools_3 = expected_tools_2 | {"list_tools"}
+# Every level also exposes reload, added in b00fbb0; these expectations were
+# never updated for it.
+expected_tools_3 = {"get_tool_schema", "invoke_tool", "reload"}
+expected_tools_4 = expected_tools_3 | {"list_tools"}
 
 
 @pytest.mark.parametrize(
     "proxy_mcp_client,expected_tools",
     [
-        (CompressionLevel.LOW, expected_tools_2),
-        (CompressionLevel.MEDIUM, expected_tools_2),
-        (CompressionLevel.HIGH, expected_tools_2),
-        (CompressionLevel.MAX, expected_tools_3),
+        (CompressionLevel.LOW, expected_tools_3),
+        (CompressionLevel.MEDIUM, expected_tools_3),
+        (CompressionLevel.HIGH, expected_tools_3),
+        (CompressionLevel.MAX, expected_tools_4),
     ],
     indirect=["proxy_mcp_client"],
 )
@@ -188,7 +190,8 @@ async def test_invoke_tool_validation_errors_include_schema(proxy_mcp_client: Cl
     error_message = str(exc_info.value)
     assert "Tool 'add' input validation failed:" in error_message
     assert "Here is the result of get_tool_schema('add'):" in error_message
-    assert "<tool>add(a, b)" in error_message
+    # Required parameters are tagged [REQUIRED] since 4d6a1d6.
+    assert "<tool>add(a [REQUIRED], b [REQUIRED])" in error_message
     assert '"required": [' in error_message
     assert '"a"' in error_message
     assert '"b"' in error_message
@@ -210,7 +213,9 @@ async def test_missing_tool_errors_include_available_tools(
         await proxy_mcp_client.call_tool(wrapper_tool_name, wrapper_args)
 
     error_message = str(exc_info.value)
-    assert "Tool 'missing_tool' not found in backend MCP server." in error_message
+    # ToolNotFound gained "Did you mean" suggestions in 92d0d75; the sentence
+    # no longer names the backend.
+    assert "Tool 'missing_tool' not found." in error_message
     assert "Available tools:" in error_message
     for tool_name in [
         "add",
@@ -289,7 +294,7 @@ async def test_include_and_exclude_tools_filters_exposed_backend_tools() -> None
     ):
         schema = await client.call_tool("test_server_get_tool_schema", {"tool_name": "add"})
         assert schema.content
-        assert "add(a, b)" in schema.content[0].text
+        assert "add(a [REQUIRED], b [REQUIRED])" in schema.content[0].text
 
         result = await client.call_tool("test_server_invoke_tool", {"tool_name": "add", "a": 2, "b": 3})
         assert result.content[0].text == "5"
