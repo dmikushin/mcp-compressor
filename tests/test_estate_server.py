@@ -157,14 +157,117 @@ class TestUnknownServer:
 
 
 class TestReload:
-    async def test_reloading_an_unstarted_server_does_not_start_it(self, tmp_path, monkeypatch) -> None:
-        # Starting a subprocess as a side effect of "reload" is an action
-        # dressed as a no-op.
+    async def test_reloading_an_unstarted_server_starts_it(self, tmp_path, monkeypatch) -> None:
+        # The estate is lazy, so under normal use almost nothing is running. A
+        # reload that declines to act whenever it finds nothing running is a
+        # reload that declines to act nearly always, while telling the caller
+        # who asked because something changed that a no-op was the right answer.
         monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
-        estate = Estate([spec("github")])
-        message = await estate.reload("github")
-        assert "not running" in message
-        assert not estate._backend("github").is_started
+        script = tmp_path / "probe_server.py"
+        script.write_text(
+            "from fastmcp import FastMCP\n"
+            "mcp = FastMCP('probe')\n"
+            "@mcp.tool()\n"
+            "def ping() -> str:\n"
+            "    return 'pong'\n"
+            "mcp.run()\n"
+        )
+        estate = Estate([ServerSpec(name="probe", command=sys.executable, args=[str(script)])])
+        try:
+            assert not estate._backend("probe").is_started
+
+            message = await estate.reload("probe")
+
+            assert "Started" in message
+            assert "1 tools available" in message
+            assert estate._backend("probe").is_started
+        finally:
+            await estate.close()
+
+    async def test_reload_rereads_the_configuration(self, tmp_path, monkeypatch) -> None:
+        # Reload is asked for after something on disk changed, and the change is
+        # as likely to be the command in the configuration as the code it points
+        # at. Restarting against the spec read at startup would relaunch exactly
+        # the program the caller is trying to stop using.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+
+        def write_server(tool_name: str) -> str:
+            script = tmp_path / f"{tool_name}_server.py"
+            script.write_text(
+                "from fastmcp import FastMCP\n"
+                "mcp = FastMCP('probe')\n"
+                "@mcp.tool()\n"
+                f"def {tool_name}() -> str:\n"
+                f"    return '{tool_name}'\n"
+                "mcp.run()\n"
+            )
+            return str(script)
+
+        config = tmp_path / "config.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "probe": {"command": sys.executable, "args": [write_server("before")]}
+                    }
+                }
+            )
+        )
+        estate = Estate(
+            [ServerSpec(name="probe", command=sys.executable, args=[write_server("before")])],
+            config_path=config,
+        )
+        try:
+            await estate.catalog("probe")
+
+            config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "probe": {"command": sys.executable, "args": [write_server("after")]}
+                        }
+                    }
+                )
+            )
+
+            message = await estate.reload("probe")
+
+            assert "1 tools available" in message
+            assert "after" in await estate.catalog("probe")
+            assert "before" not in await estate.catalog("probe")
+        finally:
+            await estate.close()
+
+    async def test_reload_refreshes_the_catalog_rather_than_reusing_the_cache(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # A lazy start fills the wrapper from disk without talking to the
+        # backend, and connecting afterwards does not undo that. Without an
+        # explicit refetch, reload reports the catalogue the old code wrote and
+        # leaves the stale file on disk to mislead the next start too.
+        monkeypatch.setattr(cc, "_CACHE_DIR", tmp_path / "catalogs")
+        script = tmp_path / "probe_server.py"
+        script.write_text(
+            "from fastmcp import FastMCP\n"
+            "mcp = FastMCP('probe')\n"
+            "@mcp.tool()\n"
+            "def real_tool() -> str:\n"
+            "    return 'x'\n"
+            "mcp.run()\n"
+        )
+        estate = Estate([ServerSpec(name="probe", command=sys.executable, args=[str(script)])])
+        try:
+            key = estate._backend("probe").cache_key
+            cc.save(key, [{"name": "stale_tool"}], server="probe")
+            assert "stale_tool" in await estate.catalog("probe")
+
+            await estate.reload("probe")
+
+            out = await estate.catalog("probe")
+            assert "real_tool" in out
+            assert "stale_tool" not in out
+        finally:
+            await estate.close()
 
     async def test_reload_replaces_the_subprocess(self, tmp_path, monkeypatch) -> None:
         # The failure this guards against is silent: recycling the client

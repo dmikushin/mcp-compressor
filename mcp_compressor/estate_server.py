@@ -157,11 +157,17 @@ class EstateBackend:
         precisely when the code on disk has changed, so the connection is
         forced here instead of being deferred to whenever something next
         happens to call this server.
+
+        Forcing the connection is still not enough on its own. tools() will
+        have filled the wrapper from the disk cache and connecting does not
+        replace what it filled, so the catalog would remain the one the old
+        code wrote — a restart nobody could observe, on top of a stale file
+        that would go on lying to the next start. refresh_catalog() is what
+        asks the restarted backend what it actually has.
         """
         await self.stop()
         tools = await self.tools()
-        if self._manager is not None:
-            await self._manager.ensure_connected()
+        await tools.refresh_catalog()
         return tools
 
 
@@ -320,11 +326,32 @@ class Estate:
         return await (await backend.tools()).invoke_tool(tool, tool_input)
 
     async def reload(self, server: str) -> str:
+        """Restart one backend against the current configuration.
+
+        The configuration is re-read first. Reload is asked for after something
+        on disk changed, and the change is as likely to be the command in the
+        configuration as the code it points at; restarting a backend against
+        the spec this process happened to read at startup would relaunch the
+        very program the caller is trying to stop using.
+
+        A backend that was never started is started rather than refused. The
+        estate is lazy, so under normal use almost nothing is running, and a
+        reload that declines to act whenever it finds nothing running is a
+        reload that declines to act nearly always — while the caller, who asked
+        because something changed, is told a no-op was correct and moves on.
+        """
+        try:
+            await self.rescan()
+        except ConfigError as exc:
+            # Reloading against a known-stale spec is worse than not reloading:
+            # it would look like it worked.
+            raise RuntimeError(
+                f"Configuration could not be re-read, so {server!r} was not "
+                f"reloaded: {exc}"
+            ) from exc
+
         backend = self._backend(server)
-        if not backend.is_started:
-            # Reloading something that was never started is a no-op dressed as
-            # an action; say so rather than starting it as a side effect.
-            return f"Server {server!r} is not running; nothing to reload."
+        was_started = backend.is_started
 
         # Recycling the client session is not a restart: the transport keeps
         # the subprocess alive, so the old code stays in memory and the caller
@@ -342,10 +369,9 @@ class Estate:
                 "The backend was left stopped."
             )
         catalog = await tools.get_backend_tools()
-        return (
-            f"Restarted {server!r}: pid {died[0] if died else '?'} -> {born[0]}, "
-            f"{len(catalog)} tools available."
-        )
+        verb = "Restarted" if was_started else "Started"
+        transition = f"pid {died[0]} -> {born[0]}" if died else f"pid {born[0]}"
+        return f"{verb} {server!r}: {transition}, {len(catalog)} tools available."
 
     async def close(self) -> None:
         for backend in self._backends.values():
@@ -400,8 +426,10 @@ def build_estate_server(estate: Estate, name: str = "MCP Compressor Estate") -> 
     async def reload(server: str) -> str:
         """Restart one backend and refresh its tool catalog.
 
-        For a server whose code changed on disk, or one that has stopped
-        answering. Servers that were never started are left alone.
+        For a server whose code changed on disk, or whose command changed in the
+        configuration, or one that has stopped answering. The configuration is
+        re-read first, and a backend that was not running is started, so this
+        acts whatever state the estate happened to be in.
 
         The reply names the old and new process ids, because a restart that
         silently did not happen is the failure this tool is most prone to.

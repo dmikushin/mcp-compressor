@@ -401,6 +401,25 @@ class CompressedTools(CatalogTransform):
         backend_tools = await self._get_backend_tools(ctx)
         return await self._get_tool_descriptions_from(list(backend_tools.values()), CompressionLevel.MEDIUM)
 
+    async def refresh_catalog(self) -> dict[str, Tool]:
+        """Re-read the backend's catalog from the backend and rewrite the disk cache.
+
+        A lazy start populates the tool cache from disk without ever talking to
+        the backend, and connecting afterwards does not undo that: the stubs
+        loaded from the cache stay in place. So a caller that has just restarted
+        a backend precisely because its code changed would still be served the
+        catalog the old code wrote, and the stale file would survive on disk to
+        mislead the next start as well.
+
+        This is the step that makes a restart observable. It connects if needed,
+        asks the backend what it now has, and saves that.
+        """
+        if self._client_manager is not None:
+            await self._client_manager.ensure_connected()
+        self.invalidate_tool_cache()
+        await self._configure_backend_tool_visibility_post_reload()
+        return await self.get_backend_tools()
+
     async def reload_backend(self) -> str:
         """Reload the wrapped MCP server by reconnecting its backend session.
 
