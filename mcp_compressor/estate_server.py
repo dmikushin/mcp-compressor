@@ -34,7 +34,12 @@ from typing import Any
 
 import psutil
 from fastmcp import FastMCP
-from fastmcp.client.transports import StdioTransport
+from fastmcp.client.transports import (
+    ClientTransport,
+    SSETransport,
+    StdioTransport,
+    StreamableHttpTransport,
+)
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
 from fastmcp.tools.tool import ToolResult
 from loguru import logger
@@ -74,16 +79,36 @@ class EstateBackend:
         self._compression_level = compression_level
         self._tools: CompressedTools | None = None
         self._manager: ReloadableClientManager | None = None
-        self._transport: StdioTransport | None = None
+        self._transport: ClientTransport | None = None
         self._lock = asyncio.Lock()
 
     @property
     def cache_key(self) -> str:
-        return _catalog_cache.make_cache_key(" ".join(self.spec.argv), server_name=self.spec.name)
+        return _catalog_cache.make_cache_key(self.spec.source, server_name=self.spec.name)
 
     @property
     def is_started(self) -> bool:
         return self._tools is not None
+
+    def _make_transport(self) -> ClientTransport:
+        """The SDK transport for this backend's configured type.
+
+        One of the SDK's own transports per type — no protocol is implemented
+        here. A remote transport carries its configured headers; a stdio
+        transport carries command, args, env and cwd.
+        """
+        if self.spec.transport == "http":
+            return StreamableHttpTransport(
+                url=self.spec.url or "", headers=self.spec.headers or None
+            )
+        if self.spec.transport == "sse":
+            return SSETransport(url=self.spec.url or "", headers=self.spec.headers or None)
+        return StdioTransport(
+            command=self.spec.command or "",
+            args=self.spec.args,
+            env=self.spec.env or None,
+            cwd=self.spec.cwd,
+        )
 
     async def tools(self) -> CompressedTools:
         """The backend's compressed interface, building it on first use.
@@ -97,13 +122,8 @@ class EstateBackend:
         async with self._lock:
             if self._tools is not None:
                 return self._tools
-            logger.info(f"Starting backend {self.spec.name!r}: {' '.join(self.spec.argv)}")
-            transport = StdioTransport(
-                command=self.spec.command,
-                args=self.spec.args,
-                env=self.spec.env or None,
-                cwd=self.spec.cwd,
-            )
+            logger.info(f"Starting backend {self.spec.name!r}: {self.spec.source}")
+            transport = self._make_transport()
 
             async def connect() -> ProxyClient:
                 client = ProxyClient(transport=transport, init_timeout=None)
@@ -118,7 +138,7 @@ class EstateBackend:
                 server_name=self.spec.name,
                 client_manager=manager,
                 catalog_cache_key=self.cache_key,
-                catalog_source=" ".join(self.spec.argv),
+                catalog_source=self.spec.source,
             )
             try:
                 await compressed.configure_server()
@@ -143,13 +163,15 @@ class EstateBackend:
             if self._manager is not None:
                 with contextlib.suppress(Exception):
                     await self._manager.stop()
-            # Closing the session is not enough. StdioTransport defaults to
-            # keep_alive=True, which deliberately leaves the subprocess running
-            # between connections, and a later connect() on the same transport
-            # returns early because _connect_task is still set - so the process is
-            # neither replaced nor reused-from-scratch. disconnect() is the only
-            # thing that actually takes it down.
-            if self._transport is not None:
+            # Closing the session is not enough for stdio. StdioTransport
+            # defaults to keep_alive=True, which deliberately leaves the
+            # subprocess running between connections, and a later connect() on
+            # the same transport returns early because _connect_task is still
+            # set - so the process is neither replaced nor reused-from-scratch.
+            # disconnect() is the only thing that actually takes it down. A
+            # remote transport holds no such process: closing the client session
+            # above is its full teardown, and it has no disconnect().
+            if isinstance(self._transport, StdioTransport):
                 with contextlib.suppress(Exception):
                     await self._transport.disconnect()
             self._manager = None
@@ -361,10 +383,19 @@ class Estate:
         backend = self._backend(server)
         was_started = backend.is_started
 
-        # Recycling the client session is not a restart: the transport keeps
-        # the subprocess alive, so the old code stays in memory and the caller
-        # is told it was reloaded. Tear the backend down and build it again,
-        # then prove the process changed instead of asserting that it did.
+        # A remote backend has no subprocess to prove anything about: "restart"
+        # is close-and-reconnect, and the honest report is that it reconnected
+        # and how many tools it has, not a pretend pid change.
+        if backend.spec.is_remote:
+            tools = await backend.restart()
+            catalog = await tools.get_backend_tools()
+            verb = "Reconnected" if was_started else "Connected"
+            return f"{verb} {server!r} ({backend.spec.url}): {len(catalog)} tools available."
+
+        # Recycling the client session is not a restart for stdio: the transport
+        # keeps the subprocess alive, so the old code stays in memory and the
+        # caller is told it was reloaded. Tear the backend down and build it
+        # again, then prove the process changed instead of asserting that it did.
         before = _own_child_pids()
         tools = await backend.restart()
         after = _own_child_pids()

@@ -35,12 +35,43 @@ class TestLoadServers:
         )
         assert [s.name for s in load_servers(path)] == ["apkext", "gdb", "zulip"]
 
-    def test_skips_non_stdio_entries(self, tmp_path) -> None:
+    def test_fronts_stdio_http_and_sse(self, tmp_path) -> None:
         path = write(
             tmp_path,
-            {"mcpServers": {"remote": {"type": "http", "url": "https://x"}, "local": {"command": "l"}}},
+            {
+                "mcpServers": {
+                    "remote": {"type": "http", "url": "https://x/mcp", "headers": {"A": "b"}},
+                    "events": {"type": "sse", "url": "https://y/sse"},
+                    "local": {"command": "l"},
+                }
+            },
         )
-        assert [s.name for s in load_servers(path)] == ["local"]
+        specs = {s.name: s for s in load_servers(path)}
+        assert sorted(specs) == ["events", "local", "remote"]
+        assert specs["remote"].transport == "http"
+        assert specs["remote"].url == "https://x/mcp"
+        assert specs["remote"].headers == {"A": "b"}
+        assert specs["remote"].source == "https://x/mcp"
+        assert specs["events"].transport == "sse"
+        assert specs["local"].transport == "stdio"
+        assert specs["local"].source == "l"
+
+    def test_streamable_http_is_a_synonym_for_http(self, tmp_path) -> None:
+        path = write(tmp_path, {"mcpServers": {"r": {"type": "streamable-http", "url": "https://z"}}})
+        assert [s.transport for s in load_servers(path)] == ["http"]
+
+    def test_ignores_unknown_type_and_remote_without_url(self, tmp_path) -> None:
+        path = write(
+            tmp_path,
+            {
+                "mcpServers": {
+                    "weird": {"type": "carrier-pigeon", "url": "https://x"},
+                    "nourl": {"type": "http"},
+                    "ok": {"command": "c"},
+                }
+            },
+        )
+        assert [s.name for s in load_servers(path)] == ["ok"]
 
     def test_skips_entries_with_no_command(self, tmp_path) -> None:
         path = write(tmp_path, {"mcpServers": {"broken": {"args": ["x"]}, "ok": {"command": "c"}}})

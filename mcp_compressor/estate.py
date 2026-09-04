@@ -11,6 +11,23 @@ The shape read here is the one every MCP client writes — a ``mcpServers`` obje
 mapping a name to a launch spec. It is looked for at the top level and under
 ``projects.<path>``, because Claude Code keeps per-project servers there.
 
+## Supported configurations
+
+Every external transport a client can configure is fronted, so that the client
+keeps exactly one external connection — to this estate — and dials nothing
+itself:
+
+- ``{"command", "args"?, "env"?, "cwd"?}`` or ``{"type": "stdio", ...}`` — a
+  subprocess. ``command`` is required.
+- ``{"type": "http", "url", "headers"?}`` (``"streamable-http"`` is accepted as
+  a synonym) — a remote Streamable HTTP server. ``url`` is required.
+- ``{"type": "sse", "url", "headers"?}`` — a remote SSE server. ``url`` is
+  required.
+
+An entry with an unknown ``type``, a stdio entry with no ``command``, or a
+remote entry with no ``url`` is ignored — the estate fronts what it can launch
+or dial and is silent about the rest.
+
 ## The self-reference trap
 
 Once the estate is fronted by a single compressor, the client's configuration
@@ -44,17 +61,43 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class ServerSpec:
-    """One backend the compressor is responsible for."""
+    """One backend the compressor is responsible for.
+
+    A backend is one of three transports, discriminated by ``transport``:
+
+    - ``"stdio"`` — a local subprocess. ``command`` is required; ``args``,
+      ``env`` and ``cwd`` apply. This is the default when a configuration entry
+      names no ``type``.
+    - ``"http"`` — a remote Streamable HTTP server. ``url`` is required;
+      ``headers`` apply. ``command``/``args``/``cwd`` do not.
+    - ``"sse"`` — a remote SSE server. ``url`` is required; ``headers`` apply.
+
+    ``source`` is the stable identity used for the catalog cache key and log
+    lines: the argv for stdio, the URL for a remote. It must not change between
+    runs for the same configured backend, or its cached catalog is orphaned.
+    """
 
     name: str
-    command: str
+    transport: str = "stdio"
+    command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_remote(self) -> bool:
+        return self.transport in ("http", "sse")
 
     @property
     def argv(self) -> list[str]:
-        return [self.command, *self.args]
+        return [self.command or "", *self.args]
+
+    @property
+    def source(self) -> str:
+        """Stable identity for the cache key and logs."""
+        return self.url if self.is_remote else " ".join(self.argv)
 
 
 def _is_compressor(command: str) -> bool:
@@ -103,10 +146,41 @@ def _expand(value: str) -> str:
     return os.path.expandvars(value)
 
 
+def _headers(raw: dict[str, Any]) -> dict[str, str]:
+    return {str(k): _expand(str(v)) for k, v in (raw.get("headers") or {}).items()}
+
+
 def _spec_from(name: str, raw: dict[str, Any]) -> ServerSpec | None:
-    """Build a spec, or ``None`` when the entry is not a launchable stdio server."""
-    if raw.get("type", "stdio") != "stdio":
+    """Build a spec, or ``None`` when the entry is not a launchable backend.
+
+    Three transports are recognised, by the ``type`` the client writes:
+
+    - absent or ``"stdio"`` → a subprocess; requires ``command``.
+    - ``"http"`` (or ``"streamable-http"``) → a remote; requires ``url``.
+    - ``"sse"`` → a remote; requires ``url``.
+
+    Anything else — an unknown ``type``, a stdio entry with no command, a remote
+    entry with no url — is ignored (returns ``None``): the estate fronts what it
+    can launch or dial and says nothing about what it cannot, exactly as it did
+    when it only understood stdio.
+    """
+    kind = raw.get("type", "stdio")
+
+    if kind in ("http", "streamable-http", "sse"):
+        url = raw.get("url")
+        if not isinstance(url, str) or not url:
+            return None
+        transport = "sse" if kind == "sse" else "http"
+        return ServerSpec(
+            name=name,
+            transport=transport,
+            url=url,
+            headers=_headers(raw),
+        )
+
+    if kind != "stdio":
         return None
+
     command = raw.get("command")
     if not isinstance(command, str) or not command:
         return None
@@ -124,7 +198,9 @@ def _spec_from(name: str, raw: dict[str, Any]) -> ServerSpec | None:
         merged.update(env)
         env = merged
 
-    return ServerSpec(name=name, command=command, args=args, env=env, cwd=raw.get("cwd"))
+    return ServerSpec(
+        name=name, transport="stdio", command=command, args=args, env=env, cwd=raw.get("cwd")
+    )
 
 
 def _server_maps(doc: dict[str, Any], project: str | None) -> list[dict[str, Any]]:
@@ -143,7 +219,7 @@ def _server_maps(doc: dict[str, Any], project: str | None) -> list[dict[str, Any
 
 
 def load_servers(path: str | Path, project: str | None = None) -> list[ServerSpec]:
-    """Every stdio server a client configuration declares, sorted by name.
+    """Every external server a client configuration declares, sorted by name.
 
     Sorted because the order of the estate must be a property of the
     configuration and not of dictionary iteration: a catalog that reorders
