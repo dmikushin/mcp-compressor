@@ -132,21 +132,29 @@ class EstateBackend:
             return compressed
 
     async def stop(self) -> None:
-        if self._manager is not None:
-            with contextlib.suppress(Exception):
-                await self._manager.stop()
-        # Closing the session is not enough. StdioTransport defaults to
-        # keep_alive=True, which deliberately leaves the subprocess running
-        # between connections, and a later connect() on the same transport
-        # returns early because _connect_task is still set - so the process is
-        # neither replaced nor reused-from-scratch. disconnect() is the only
-        # thing that actually takes it down.
-        if self._transport is not None:
-            with contextlib.suppress(Exception):
-                await self._transport.disconnect()
-        self._manager = None
-        self._tools = None
-        self._transport = None
+        # The same lock the first start takes. Without it, a stop() racing a
+        # cold tools() reads self._transport before the start assigns it (line
+        # 131), nulls the fields, and leaves the just-spawned subprocess
+        # untracked and never disconnected. Under the lock, start and stop on
+        # one backend are strictly ordered: either stop tears down what a
+        # completed start built, or it runs first and start builds fresh.
+        # Different backends still never wait on each other.
+        async with self._lock:
+            if self._manager is not None:
+                with contextlib.suppress(Exception):
+                    await self._manager.stop()
+            # Closing the session is not enough. StdioTransport defaults to
+            # keep_alive=True, which deliberately leaves the subprocess running
+            # between connections, and a later connect() on the same transport
+            # returns early because _connect_task is still set - so the process is
+            # neither replaced nor reused-from-scratch. disconnect() is the only
+            # thing that actually takes it down.
+            if self._transport is not None:
+                with contextlib.suppress(Exception):
+                    await self._transport.disconnect()
+            self._manager = None
+            self._tools = None
+            self._transport = None
 
     async def restart(self) -> CompressedTools:
         """Take the backend down and bring it back up, for real.

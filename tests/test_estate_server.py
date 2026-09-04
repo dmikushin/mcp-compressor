@@ -1,5 +1,6 @@
 """Tests for mcp_compressor/estate_server.py."""
 
+import asyncio
 import json
 import sys
 
@@ -420,3 +421,87 @@ class TestRescan:
         estate = Estate([spec("github")])
         assert await estate.rescan() == []
         assert estate.names == ["github"]
+
+
+class TestStartStopRace:
+    """A stop() racing a cold first start must not tear the backend.
+
+    Before stop() took the per-backend lock, a stop() issued while tools() was
+    mid-spawn could null the fields around the start's own assignment and leave
+    the freshly spawned subprocess untracked and never disconnected. With both
+    under one lock the two are strictly ordered; this drives that interleaving.
+    """
+
+    async def test_stop_mid_spawn_serialises_and_leaves_no_orphan(
+        self, monkeypatch
+    ) -> None:
+        import mcp_compressor.estate_server as es
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class _RecordingTransport:
+            def __init__(self, **_: object) -> None:
+                self.disconnected = False
+                transports.append(self)
+
+            async def disconnect(self) -> None:
+                self.disconnected = True
+
+        transports: list[_RecordingTransport] = []
+
+        class _FakeManager:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def get_client(self) -> None:
+                return None
+
+            async def stop(self) -> None:
+                pass
+
+        class _FakeProxy:
+            def __init__(self, *_: object, **__: object) -> None:
+                pass
+
+        class _SlowCompressed:
+            def __init__(self, *_: object, **__: object) -> None:
+                pass
+
+            async def configure_server(self) -> None:
+                # Reached inside tools()'s lock; the spawn then hangs here until
+                # the test releases it — the window a racing stop() used to corrupt.
+                entered.set()
+                await release.wait()
+
+        monkeypatch.setattr(es, "StdioTransport", _RecordingTransport)
+        monkeypatch.setattr(es, "ReloadableClientManager", _FakeManager)
+        monkeypatch.setattr(es, "FastMCPProxy", _FakeProxy)
+        monkeypatch.setattr(es, "CompressedTools", _SlowCompressed)
+
+        backend = es.EstateBackend(spec("racy"), CompressionLevel.MAX)
+
+        start = asyncio.create_task(backend.tools())
+        # Wait until the spawn is inside the lock — bounded, so a broken spawn
+        # surfaces its own exception instead of hanging the test.
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+        except TimeoutError:
+            start.cancel()
+            raise AssertionError(f"the start never reached the lock: {start}") from None
+        assert backend._lock.locked()
+
+        stop = asyncio.create_task(backend.stop())
+        # stop() must be waiting on the lock, not racing ahead of the start.
+        await asyncio.sleep(0.05)
+        assert not stop.done(), "stop() ran without waiting for the start's lock"
+
+        release.set()
+        await asyncio.wait_for(asyncio.gather(start, stop), timeout=5)
+
+        # stop() acquired the lock after the start completed and tore down what
+        # it built: no live transport with nulled fields.
+        assert backend._transport is None
+        assert not backend.is_started
+        assert len(transports) == 1
+        assert transports[0].disconnected, "the spawned transport was orphaned"
