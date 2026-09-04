@@ -37,11 +37,21 @@ def make_cache_key(
     include_tools: list[str] | None = None,
     exclude_tools: list[str] | None = None,
     server_name: str | None = None,
+    credentials_fingerprint: str = "",
 ) -> str:
-    """Return a short stable hex key for the given backend configuration."""
+    """Return a short stable hex key for the given backend configuration.
+
+    ``credentials_fingerprint`` is a digest of the spec's env and headers
+    (ServerSpec.credentials_fingerprint): a backend's tool list depends on
+    what it is authorised to do, so a changed token is a different catalog
+    and must be a different key. Empty keeps the key of a spec that has no
+    credentials.
+    """
     parts = [command_or_url]
     if server_name:
         parts.append("name:" + server_name)
+    if credentials_fingerprint:
+        parts.append("cred:" + credentials_fingerprint)
     if include_tools:
         parts.append("include:" + ",".join(sorted(include_tools)))
     if exclude_tools:

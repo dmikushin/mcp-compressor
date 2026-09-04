@@ -40,6 +40,7 @@ dropped by construction rather than by hoping the name never matches.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -96,8 +97,29 @@ class ServerSpec:
 
     @property
     def source(self) -> str:
-        """Stable identity for the cache key and logs."""
+        """Stable identity for logs: the command line or the URL, no secrets."""
         return self.url if self.is_remote else " ".join(self.argv)
+
+    @property
+    def credentials_fingerprint(self) -> str:
+        """A digest of ``env`` and ``headers`` — the part of a spec that
+        changes a backend's tool list without changing its command.
+
+        The catalog cache used to be keyed on ``source`` alone, so replacing a
+        token in the configuration left the catalog the old token had written
+        on disk, and ``catalog`` kept serving it until someone happened to
+        ``reload`` that server. Measured on this machine: a GitHub PAT with
+        org access lists 41 tools, one without lists 38. A digest, not the
+        values: the key is a filename under ~/.cache and must not carry the
+        secret it stands for. Empty when there is nothing to fingerprint, so
+        specs without credentials keep the key they had.
+        """
+        if not self.env and not self.headers:
+            return ""
+        material = "\x00".join(
+            f"{k}={v}" for k, v in sorted({**self.env, **{"h:" + k: v for k, v in self.headers.items()}}.items())
+        )
+        return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def _is_compressor(command: str) -> bool:

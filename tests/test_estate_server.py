@@ -316,6 +316,39 @@ class TestCacheKeyCompatibility:
         assert estate._backend("github").cache_key == expected
 
 
+class TestCacheKeyFollowsCredentials:
+    """A backend's tool list depends on what its token may do (a GitHub PAT
+    with org access lists 41 tools, one without lists 38), so a replaced
+    token must be a different catalog file — not the old token's list served
+    until someone happens to reload."""
+
+    def _key(self, **env: str) -> str:
+        s = ServerSpec(name="github", command="docker", args=["run", "ghcr.io/x"], env=env)
+        return Estate([s])._backend("github").cache_key
+
+    def test_a_replaced_token_is_a_different_key(self) -> None:
+        assert self._key(TOKEN="ghp_old") != self._key(TOKEN="ghp_new")
+
+    def test_the_same_token_is_the_same_key(self) -> None:
+        assert self._key(TOKEN="ghp_same") == self._key(TOKEN="ghp_same")
+
+    def test_headers_count_as_credentials_for_remote_specs(self) -> None:
+        a = ServerSpec(name="r", transport="http", url="http://h/mcp", headers={"Authorization": "Bearer a"})
+        b = ServerSpec(name="r", transport="http", url="http://h/mcp", headers={"Authorization": "Bearer b"})
+        assert Estate([a])._backend("r").cache_key != Estate([b])._backend("r").cache_key
+
+    def test_no_credentials_keeps_the_key_it_had(self) -> None:
+        # Specs without env/headers must not be re-indexed by this change.
+        s = ServerSpec(name="tmux", command="npx", args=["tmux-mcp"])
+        assert Estate([s])._backend("tmux").cache_key == cc.make_cache_key("npx tmux-mcp", server_name="tmux")
+
+    def test_the_secret_is_not_in_the_key(self) -> None:
+        secret = "ghp_verysecretvalue1234567890"
+        key = self._key(TOKEN=secret)
+        assert secret not in key
+        assert ServerSpec(name="g", command="x", env={"TOKEN": secret}).credentials_fingerprint != secret
+
+
 class TestServerSurface:
     """Four tools, and no more: the count is the point."""
 

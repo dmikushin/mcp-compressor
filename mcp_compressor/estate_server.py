@@ -84,7 +84,11 @@ class EstateBackend:
 
     @property
     def cache_key(self) -> str:
-        return _catalog_cache.make_cache_key(self.spec.source, server_name=self.spec.name)
+        return _catalog_cache.make_cache_key(
+            self.spec.source,
+            server_name=self.spec.name,
+            credentials_fingerprint=self.spec.credentials_fingerprint,
+        )
 
     @property
     def is_started(self) -> bool:
