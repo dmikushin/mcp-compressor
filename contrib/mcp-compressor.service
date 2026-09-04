@@ -1,4 +1,4 @@
-# MCP Compressor backend-pool daemon as a systemd user service.
+# MCP Compressor daemon as a systemd user service.
 #
 # Install (per user):
 #   mkdir -p ~/.config/systemd/user
@@ -6,22 +6,21 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now mcp-compressor.service
 #
-# After this, any MCP client config invoking `mcp-compressor` without
-# `--server` (i.e. the default client-mode wrapping pattern) will find
-# the pool at 127.0.0.1:9020 and connect successfully. Without the
-# daemon, client-mode invocations fail with `httpx.ConnectError: All
-# connection attempts failed` and the MCP host (Claude Code, Cursor,
-# Continue, ...) reports "Failed to connect to <server-name>".
+# mcp-compressor is one service per user. It fronts the estate — every server
+# in your MCP configuration — behind four tools at http://127.0.0.1:9020/mcp.
+# MCP clients connect to that URL over streamable HTTP; they do not launch
+# mcp-compressor themselves. Point your client's MCP config at
+# { "type": "http", "url": "http://127.0.0.1:9020/mcp" }.
 
 [Unit]
-Description=MCP Compressor backend pool
+Description=MCP Compressor estate daemon
 After=network-online.target
 
 [Service]
 Type=simple
 # The default `uv tool install mcp-compressor` / `pipx install mcp-compressor`
-# layout puts the launcher at ~/.local/bin/mcp-compressor. PATH is set so
-# the wrapped MCP servers (forgejo-mcp, zulip-mcp, ...) are reachable too.
+# layout puts the launcher at ~/.local/bin/mcp-compressor. PATH is set so the
+# estate's backend servers (forgejo-mcp, zulip-mcp, ...) are reachable too.
 Environment=PATH=%h/.local/bin:%h/go/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 ExecStart=%h/.local/bin/mcp-compressor --server --server-port 9020
 Restart=always

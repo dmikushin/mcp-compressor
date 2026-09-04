@@ -32,8 +32,6 @@ from mcp.types import CallToolRequestParams, ContentBlock, TextContent
 from pydantic import ValidationError
 
 from . import catalog_cache as _catalog_cache
-from .cli_script import find_script_dir
-from .cli_tools import build_help_tool_description
 from .types import CompressionLevel
 
 # Minimum output length before quiet mode truncation applies
@@ -187,15 +185,13 @@ class InvokeToolCompatibilityMiddleware(Middleware):
 class CompressedTools(CatalogTransform):
     """Transform that replaces the tool catalog with compressed wrapper tools.
 
-    In normal mode it exposes two or three public wrapper tools:
+    It exposes two or three public wrapper tools:
     - get_tool_schema: Retrieves the full schema for a specific tool
     - invoke_tool: Executes a tool with the provided arguments
     - list_tools: (optional) Lists all available tools with brief descriptions (only if compression level is MAX)
 
     It also exposes a resource (``compressor://uncompressed-tools``) that returns the upstream server's original
     list_tools payload in machine-readable JSON form.
-
-    In CLI mode it exposes a single help tool (<server_name>_help) instead of the wrapper tool catalog.
     """
 
     def __init__(
@@ -204,8 +200,6 @@ class CompressedTools(CatalogTransform):
         compression_level: CompressionLevel,
         server_name: str | None = None,
         toonify: bool = False,
-        cli_mode: bool = False,
-        cli_name: str | None = None,
         include_tools: Sequence[str] | None = None,
         exclude_tools: Sequence[str] | None = None,
         client_manager: ReloadableClientManager | None = None,
@@ -219,8 +213,6 @@ class CompressedTools(CatalogTransform):
         self._tool_name_prefix = f"{server_name}_" if server_name else ""
         self._server_description = f"the {server_name} toolset" if server_name else "this toolset"
         self._toonify = toonify
-        self._cli_mode = cli_mode
-        self._cli_name = cli_name or (server_name or "mcp")
         self._include_tools = set(include_tools or [])
         self._exclude_tools = set(exclude_tools or [])
         self._client_manager = client_manager
@@ -228,7 +220,6 @@ class CompressedTools(CatalogTransform):
         self._catalog_source = catalog_source
         self._cached_backend_tools: dict[str, Tool | CachedTool] | None = None
         self._tool_cache_lock: asyncio.Lock = asyncio.Lock()
-        self._help_tool_name = sanitize_tool_name(f"{server_name}_help" if server_name else "help")
         self._get_schema_tool_name = sanitize_tool_name(f"{self._tool_name_prefix}get_tool_schema")
         self._invoke_tool_name = sanitize_tool_name(f"{self._tool_name_prefix}invoke_tool")
         self._invoke_tool_alias_name = sanitize_tool_name("invoke_tool")
@@ -248,12 +239,9 @@ class CompressedTools(CatalogTransform):
         return tool_name not in self._wrapper_tool_names()
 
     def _wrapper_tool_names(self) -> set[str]:
-        if self._cli_mode:
-            tool_names = {self._help_tool_name}
-        else:
-            tool_names = {self._get_schema_tool_name, self._invoke_tool_name, self._invoke_tool_alias_name}
-            if self._compression_level == CompressionLevel.MAX:
-                tool_names.add(self._list_tools_name)
+        tool_names = {self._get_schema_tool_name, self._invoke_tool_name, self._invoke_tool_alias_name}
+        if self._compression_level == CompressionLevel.MAX:
+            tool_names.add(self._list_tools_name)
         if self._client_manager is not None:
             tool_names.add(self._reload_tool_name)
         return tool_names
@@ -262,14 +250,13 @@ class CompressedTools(CatalogTransform):
         """Attach the transform and any small compatibility middleware to the server."""
         await self._configure_backend_tool_visibility()
         self._proxy_server.add_transform(self)
-        if not self._cli_mode:
-            # Surface the anti-bypass guardrail once via server instructions
-            # instead of repeating it in every wrapper tool description. Preserve
-            # any backend-provided instructions by appending them.
-            base = self._wrapper_instructions()
-            existing = getattr(self._proxy_server, "instructions", None)
-            self._proxy_server.instructions = f"{base}\n\n{existing}" if existing else base
-            self._proxy_server.add_middleware(InvokeToolCompatibilityMiddleware(self))
+        # Surface the anti-bypass guardrail once via server instructions
+        # instead of repeating it in every wrapper tool description. Preserve
+        # any backend-provided instructions by appending them.
+        base = self._wrapper_instructions()
+        existing = getattr(self._proxy_server, "instructions", None)
+        self._proxy_server.instructions = f"{base}\n\n{existing}" if existing else base
+        self._proxy_server.add_middleware(InvokeToolCompatibilityMiddleware(self))
 
     async def _configure_backend_tool_visibility(self) -> None:
         """Populate the tool cache, connecting to the backend or loading from disk cache.
@@ -352,23 +339,18 @@ class CompressedTools(CatalogTransform):
             if self._cached_backend_tools is not None
             else list(tools)
         )
-        if self._cli_mode:
-            visible_tools = [self._make_help_tool(await self._build_cli_description_from(effective))]
-        else:
-            visible_tools = [
-                self._make_get_schema_tool(await self._get_tool_descriptions_from(effective, self._compression_level)),
-                self._make_invoke_tool(self._invoke_tool_name),
-            ]
-            if self._compression_level == CompressionLevel.MAX:
-                visible_tools.append(self._make_list_tools_tool())
+        visible_tools = [
+            self._make_get_schema_tool(await self._get_tool_descriptions_from(effective, self._compression_level)),
+            self._make_invoke_tool(self._invoke_tool_name),
+        ]
+        if self._compression_level == CompressionLevel.MAX:
+            visible_tools.append(self._make_list_tools_tool())
         if self._client_manager is not None:
             visible_tools.append(self._make_reload_tool())
         return visible_tools
 
     async def get_tool(self, name: str, call_next: GetToolNext, *, version: Any | None = None) -> Tool | None:
         """Return synthetic wrapper tools and delegate backend tool lookups unchanged."""
-        if self._cli_mode and name == self._help_tool_name:
-            return self._make_help_tool()
         if name == self._get_schema_tool_name:
             return self._make_get_schema_tool()
         if name in self.invoke_tool_names:
@@ -380,16 +362,14 @@ class CompressedTools(CatalogTransform):
         return await call_next(name, version=version)
 
     async def transform_resources(self, resources: Sequence[Resource]) -> Sequence[Resource]:
-        """Append the synthetic uncompressed-tools resource in normal mode."""
-        if self._cli_mode:
-            return resources
+        """Append the synthetic uncompressed-tools resource."""
         return [*resources, self._make_uncompressed_tools_resource()]
 
     async def get_resource(
         self, uri: str, call_next: GetResourceNext, *, version: Any | None = None
     ) -> Resource | None:
         """Return the synthetic resource when requested, else delegate."""
-        if not self._cli_mode and uri == self._uncompressed_tools_resource_uri:
+        if uri == self._uncompressed_tools_resource_uri:
             return self._make_uncompressed_tools_resource()
         return await call_next(uri, version=version)
 
@@ -599,22 +579,12 @@ class CompressedTools(CatalogTransform):
             compressed_schema_sizes[compression_level] = sum(
                 len(self._format_tool_description(tool, compression_level)) for tool in backend_tools.values()
             )
-        compressed_schema_sizes["cli"] = len(await self._build_cli_description())
         return {
             "original_tool_count": original_tool_count,
             "compressed_tool_count": original_tool_count,
             "original_schema_size": original_schema_size,
             "compressed_schema_sizes": compressed_schema_sizes,
         }
-
-    async def _build_cli_description(self) -> str:
-        """Build the full help description for CLI mode."""
-        backend_tools = await self.get_backend_tools()
-        return await self._build_cli_description_from(list(backend_tools.values()))
-
-    async def _build_cli_description_from(self, tools: Sequence[Tool]) -> str:
-        _, on_path = find_script_dir()
-        return build_help_tool_description(self._cli_name, self._server_description, list(tools), on_path=on_path)
 
     async def _get_tool_descriptions_from(self, tools: Sequence[Tool], compression_level: CompressionLevel) -> str:
         """Generate formatted tool descriptions for a set of tools."""
@@ -707,16 +677,6 @@ class CompressedTools(CatalogTransform):
             f"then call `{self._invoke_tool_name}` with `tool_name` and `tool_input`. Do NOT "
             f"bypass this wrapper by calling backend APIs directly, spawning curl/HTTP "
             f"requests, or asking the user for tokens."
-        )
-
-    def _make_help_tool(self, description: str | None = None) -> Tool:
-        async def help_tool() -> str:
-            return await self._build_cli_description()
-
-        return Tool.from_function(
-            help_tool,
-            name=self._help_tool_name,
-            description=description or f"Get help for the '{self._cli_name}' CLI. Lists all available subcommands.",
         )
 
     def _make_get_schema_tool(self, tool_descriptions: str | None = None) -> Tool:

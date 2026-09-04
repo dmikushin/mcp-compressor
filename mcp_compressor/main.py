@@ -1,1034 +1,114 @@
-"""Main entry point for the MCP Compressor CLI.
+"""Entry point for the MCP Compressor daemon.
 
-This module provides the CLI interface for running the MCP Compressor proxy server, which wraps existing MCP servers and
-compresses their tool descriptions to reduce token consumption.
+MCP Compressor is one service per user. It reads the client's MCP configuration,
+fronts every server in it behind four tools (catalog, get_tool_schema,
+invoke_tool, reload), and serves them over streamable HTTP at
+``http://127.0.0.1:<port>/mcp``. A backend is started once, on first use, and
+shared by every session that connects — nothing is spawned per client session.
+
+The only way to run it:
+
+    mcp-compressor --server [--server-port N] [--mcp-config PATH]
+
+Clients connect to the socket; they do not launch it.
 """
 
 import asyncio
-import contextlib
-import json
-import os
-import re
-import shutil
-import signal
-import socket
-import sys
-import threading
 import warnings
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Annotated, Any, Literal, overload
+from typing import Annotated
 
-import anyio
-import keyring
-import keyring.errors
-import psutil
 import typer
 import uvicorn
-from cryptography.fernet import Fernet
-from fastmcp import FastMCP
-from fastmcp.client.auth import OAuth
-from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
-from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
-from key_value.aio.protocols import AsyncKeyValue
-from key_value.aio.stores.filetree import (
-    FileTreeStore,
-    FileTreeV1CollectionSanitizationStrategy,
-    FileTreeV1KeySanitizationStrategy,
-)
-from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from loguru import logger
 
-from . import catalog_cache as _catalog_cache
-from .banner import print_banner
-from .cli_bridge import CliBridge
-from .cli_script import generate_cli_script, remove_cli_script_entry
-from .cli_tools import sanitize_cli_name
-from .estate import DEFAULT_MCP_CONFIG
-from .logging import configure_logging, suppress_recoverable_oauth_traceback_logging
-from .tools import CompressedTools, ReloadableClientManager
-from .types import CompressionLevel, LogLevel, TransportType
+from .estate import DEFAULT_MCP_CONFIG, load_servers
+from .estate_server import Estate, build_estate_server
+from .logging import configure_logging
+from .server import create_daemon_app
+from .types import CompressionLevel, LogLevel
 
-# Suppress known third-party deprecation warnings that are not actionable from this project.
-# uvicorn's websockets implementation uses WebSocketServerProtocol which was deprecated in websockets 14.0.
+# uvicorn's websockets implementation uses WebSocketServerProtocol, deprecated in
+# websockets 14.0; not actionable from this project.
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="uvicorn")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets")
 
-app = typer.Typer(name="MCP Compressor", help="An MCP server wrapper for reducing tokens consumed by MCP tools.")
+app = typer.Typer(name="MCP Compressor", help="A per-user MCP service that fronts your estate behind four tools.")
 
 
 @app.command()
 def main(
-    command_or_url_list: Annotated[
-        list[str] | None,
-        typer.Argument(
-            ...,
-            metavar="COMMAND_OR_URL",
-            help=(
-                "The URL of the MCP server to connect to for streamable HTTP or SSE servers, or the command and "
-                "arguments to run for stdio servers. Example: uvx mcp-server-fetch"
-            ),
-        ),
-    ] = None,
-    cwd: Annotated[
-        str | None,
-        typer.Option(
-            ...,
-            "--cwd",
-            help="The working directory to use when running stdio MCP servers.",
-        ),
-    ] = None,
-    env_list: Annotated[
-        list[str] | None,
-        typer.Option(
-            ...,
-            "--env",
-            "-e",
-            help=(
-                "Environment variables to set when running stdio MCP servers, in the form VAR_NAME=VALUE. Can be used "
-                "multiple times. Supports environment variable expansion with ${VAR_NAME} syntax."
-            ),
-        ),
-    ] = None,
-    header_list: Annotated[
-        list[str] | None,
-        typer.Option(
-            ...,
-            "--header",
-            "-H",
-            help=(
-                "Headers to use for remote (HTTP/SSE) MCP server connections, in the form Header-Name=Header-Value. "
-                "Can be use multiple times. Supports environment variable expansion with ${VAR_NAME} syntax."
-            ),
-        ),
-    ] = None,
-    timeout: Annotated[
-        float,
-        typer.Option(
-            ...,
-            "--timeout",
-            "-t",
-            help="The timeout in seconds for connecting to the MCP server and making requests.",
-        ),
-    ] = 10.0,
-    compression_level: Annotated[
-        CompressionLevel,
-        typer.Option(
-            ...,
-            "--compression-level",
-            "-c",
-            help=("The level of compression to apply to tool the tools descriptions of the wrapped MCP server."),
-            case_sensitive=False,
-        ),
-    ] = CompressionLevel.MEDIUM,
-    server_name: Annotated[
-        str | None,
-        typer.Option(
-            ...,
-            "--server-name",
-            "-n",
-            help=(
-                "Optional custom name to prefix the wrapper tool names (get_tool_schema, invoke_tool, list_tools). "
-                "The name will be sanitized to conform to MCP tool name specifications (only A-Z, a-z, 0-9, _, -, .)."
-            ),
-        ),
-    ] = None,
-    log_level: Annotated[
-        LogLevel,
-        typer.Option(
-            ...,
-            "--log-level",
-            "-l",
-            help=(
-                "The logging level. Used for both the MCP Compressor server and the underlying MCP server if it is a "
-                "stdio server."
-            ),
-            case_sensitive=False,
-        ),
-    ] = LogLevel.WARNING,
-    toonify: Annotated[
-        bool,
-        typer.Option(..., "--toonify", help="Convert JSON tool responses to TOON format automatically."),
-    ] = False,
-    cli_mode: Annotated[
-        bool,
-        typer.Option(
-            ...,
-            "--cli-mode",
-            help=(
-                "Start in CLI mode: expose a single help MCP tool, start a local HTTP bridge, "
-                "and generate a shell script for interacting with the wrapped server via CLI. "
-                "--toonify is automatically enabled in this mode."
-            ),
-        ),
-    ] = False,
-    cli_port: Annotated[
-        int | None,
-        typer.Option(
-            ...,
-            "--cli-port",
-            help="Port for the local CLI bridge HTTP server (default: random free port).",
-        ),
-    ] = None,
-    include_tools: Annotated[
-        str | None,
-        typer.Option(
-            ...,
-            "--include-tools",
-            help=("Comma-separated list of wrapped server tool names to expose. If omitted, all tools are included."),
-        ),
-    ] = None,
-    exclude_tools: Annotated[
-        str | None,
-        typer.Option(
-            ...,
-            "--exclude-tools",
-            help="Comma-separated list of wrapped server tool names to hide.",
-        ),
-    ] = None,
-    lazy: Annotated[
-        bool,
-        typer.Option(
-            ...,
-            "--lazy",
-            help=(
-                "Enable lazy loading: serve the tool catalog from a local disk cache and only start the wrapped "
-                "MCP server subprocess when a tool is actually invoked. The catalog is cached on first run and "
-                "refreshed on reload. Saves resources when many MCP servers are configured but not all are used."
-            ),
-        ),
-    ] = False,
     server_mode: Annotated[
         bool,
         typer.Option(
             ...,
             "--server",
-            help=(
-                "Run as a shared backend pool daemon. Without --server, mcp-compressor acts as a client "
-                "that connects to the pool on --server-port and spawns its backend on demand."
-            ),
+            help="Run the daemon. Required — mcp-compressor is a service, not a per-session process.",
         ),
     ] = False,
     server_port: Annotated[
         int,
-        typer.Option(
-            ...,
-            "--server-port",
-            help="Port for the server daemon to listen on, or for the client to connect to.",
-        ),
+        typer.Option(..., "--server-port", help="Port for the daemon to listen on."),
     ] = 9020,
     mcp_config: Annotated[
         str | None,
         typer.Option(
             ...,
             "--mcp-config",
-            help=(
-                "Path to the client MCP configuration to front. Only needed to override the "
-                f"default, {DEFAULT_MCP_CONFIG}."
-            ),
+            help=f"Path to the MCP configuration to front. Defaults to {DEFAULT_MCP_CONFIG}.",
         ),
     ] = None,
+    log_level: Annotated[
+        LogLevel,
+        typer.Option(..., "--log-level", "-l", help="The logging level.", case_sensitive=False),
+    ] = LogLevel.WARNING,
 ):
-    """Run the MCP Compressor proxy server.
-
-    With a COMMAND_OR_URL it wraps that one server. With none — the usual way to
-    run it — it fronts the whole estate: it reads the client's own MCP
-    configuration and exposes four tools over every server in it (catalog,
-    get_tool_schema, invoke_tool, reload), starting a backend only when one is
-    actually called.
-    """
+    """Run the MCP Compressor daemon fronting the estate at /mcp."""
     configure_logging(log_level)
 
-    # Validate mode flags
-    if mcp_config and command_or_url_list:
+    if not server_mode:
         raise typer.BadParameter(
-            "--mcp-config fronts every server in the configuration; a single "
-            "COMMAND_OR_URL cannot also be given.",
-            param_hint="'COMMAND_OR_URL'",
-        )
-    # No backend named and not the pool daemon: front the estate.
-    estate_mode = not server_mode and not command_or_url_list
-    if estate_mode and not mcp_config:
-        mcp_config = DEFAULT_MCP_CONFIG
-
-    if cli_mode and server_name is None:
-        raise typer.BadParameter("--server-name is required when using --cli-mode.", param_hint="'--server-name'")
-    if compression_level == CompressionLevel.MAX and server_name is None and not mcp_config:
-        raise typer.BadParameter(
-            "--server-name is required when using --compression-level=max.", param_hint="'--server-name'"
+            "mcp-compressor is a service. Run it with --server (optionally "
+            "--server-port and --mcp-config); clients then connect to "
+            "http://127.0.0.1:9020/mcp.",
+            param_hint="'--server'",
         )
 
-    if threading.current_thread() is threading.main_thread():
-        if server_mode:
-            # Server mode: do NOT install our own signal handlers. Uvicorn
-            # installs its own when serve() starts; they set should_exit=True
-            # so serve() returns cleanly, allowing the `finally` block in
-            # _async_main to call pool.close() for orderly backend teardown.
-            pass
-        else:
-            shutting_down = False
+    asyncio.run(_run_daemon(server_port=server_port, mcp_config=mcp_config, log_level=log_level))
 
-            def _handle_interrupt(signum: int, frame: object) -> None:
-                nonlocal shutting_down
-                if shutting_down:
-                    logger.debug("Ignoring additional interrupt signal during shutdown")
-                    return
-                shutting_down = True
-                logger.info("Server stopped")
-                # Terminate child processes (stdio backend server) to avoid zombies
-                with contextlib.suppress(Exception):
-                    current = psutil.Process()
-                    for child in current.children(recursive=True):
-                        with contextlib.suppress(Exception):
-                            child.terminate()
-                # os._exit(0) bypasses daemon thread join hangs (both stdio stdin-read
-                # threads and HTTP transport threads can block interpreter shutdown)
-                os._exit(0)
 
-            signal.signal(signal.SIGINT, _handle_interrupt)
-            signal.signal(signal.SIGTERM, _handle_interrupt)
+async def _run_daemon(server_port: int, mcp_config: str | None, log_level: LogLevel) -> None:
+    """Serve the estate over streamable HTTP, one estate for the whole daemon.
 
-    asyncio.run(
-        _async_main(
-            command_or_url_list=command_or_url_list,
-            cwd=cwd,
-            env_list=env_list,
-            header_list=header_list,
-            timeout=timeout,
-            compression_level=compression_level,
-            server_name=server_name,
-            log_level=log_level,
-            toonify=toonify or cli_mode,
-            cli_mode=cli_mode,
-            cli_port=cli_port,
-            include_tools=_parse_tool_name_list(include_tools),
-            exclude_tools=_parse_tool_name_list(exclude_tools),
-            lazy=lazy,
-            server_mode=server_mode,
-            server_port=server_port,
-            mcp_config=mcp_config,
-        )
+    Every session that connects to /mcp shares these backends: the point of the
+    service is that a backend runs once per user, not once per session. Backends
+    are still lazy — a spec is a few strings until a tool is invoked
+    (estate_server.EstateBackend).
+    """
+    config_path = mcp_config or DEFAULT_MCP_CONFIG
+    specs = load_servers(config_path)
+    logger.info(f"Estate: {len(specs)} server(s) from {config_path}")
+
+    estate = Estate(specs, compression_level=CompressionLevel.MAX, config_path=config_path)
+    estate_app = build_estate_server(estate).http_app(path="/mcp", transport="streamable-http")
+    app_ = create_daemon_app(estate_app)
+
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(app_, host="127.0.0.1", port=server_port, log_level=log_level.value)
     )
-
-
-clear_oauth_app = typer.Typer(name="clear-oauth", help="Clear stored OAuth tokens.")
-
-
-@clear_oauth_app.callback(invoke_without_command=True)
-def clear_oauth(
-    all_tokens: Annotated[
-        bool,
-        typer.Option("--all", help="Also delete the encryption key, forcing full re-authentication next run."),
-    ] = False,
-) -> None:
-    """Clear stored OAuth tokens for all servers.
-
-    Removes cached OAuth tokens so the next connection will re-authenticate.
-    By default the encryption key is preserved so new tokens are stored under
-    the same key.  Pass --all to also remove the key itself.
-    """
-    token_dir = _OAUTH_CONFIG_DIR / "oauth-tokens"
-    key_file = _OAUTH_CONFIG_DIR / ".key"
-    removed: list[str] = []
-
-    if token_dir.exists():
-        shutil.rmtree(token_dir)
-        removed.append(str(token_dir))
-
-    if all_tokens and key_file.exists():
-        key_file.unlink()
-        removed.append(str(key_file))
-
-    if removed:
-        print("Removed:")
-        for path in removed:
-            print(f"  {path}")
-        # Also clear from keyring if present
-        if all_tokens:
-            with contextlib.suppress(Exception):
-                keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
-                print(f"  keyring entry: {_KEYRING_SERVICE} / {_KEYRING_USERNAME}")
-        print("OAuth credentials cleared. You will be prompted to authenticate on next connection.")
-    else:
-        print("No stored OAuth credentials found.")
-
-
-catalog_app = typer.Typer(name="catalog", help="List cached tool names across every wrapped server.")
-
-
-@catalog_app.callback(invoke_without_command=True)
-def catalog(
-    server: Annotated[
-        str | None,
-        typer.Option("--server", "-s", help="Only this server."),
-    ] = None,
-    as_json: Annotated[
-        bool,
-        typer.Option("--json", help="Machine-readable output."),
-    ] = False,
-) -> None:
-    """Print the tool names of every server whose catalog is cached on disk.
-
-    Names only — no descriptions, no schemas.  A client shows this to a model so
-    it can see what exists; the model then asks ``get_tool_schema`` for the one
-    tool it intends to call.  Paying for 600 full schemas to use one of them is
-    the cost this whole layer exists to avoid.
-
-    Nothing is connected and no backend is started: the answer comes from the
-    catalogs ``--lazy`` already wrote.  A server that has never been run once has
-    no cache entry and cannot appear here — that is reported rather than passed
-    over in silence, because a catalog that quietly omits a server is a catalog
-    that sends a model looking for tools it will never find.
-    """
-    entries = _catalog_cache.entries()
-    if server is not None:
-        entries = [e for e in entries if e.server == server]
-
-    if as_json:
-        print(
-            json.dumps(
-                [
-                    {"server": e.server, "command": e.command, "tools": e.tool_names}
-                    for e in entries
-                ],
-                indent=2,
-            )
-        )
-        return
-
-    if not entries:
-        where = f" for server {server!r}" if server else ""
-        print(f"No cached catalogs{where} in {_catalog_cache._CACHE_DIR}.")
-        print("A server's catalog is written the first time it runs under --lazy.")
-        return
-
-    unnamed = 0
-    for entry in entries:
-        if entry.server is None:
-            unnamed += 1
-            continue
-        print(f"{entry.server} ({len(entry.tool_names)}):")
-        for name in entry.tool_names:
-            print(f"  {name}")
-    if unnamed:
-        print(
-            f"\n{unnamed} cached catalog(s) predate the server name being recorded "
-            "and cannot be attributed. They will be named once their server runs again."
-        )
-
-
-def _should_retry_stale_oauth_connect_error(exception: Exception, transport: TransportType) -> bool:
-    """Return whether a connection error looks like a stale cached OAuth state issue."""
-    if not isinstance(transport, StreamableHttpTransport | SSETransport):
-        return False
-
-    auth = getattr(transport, "auth", None)
-    if not isinstance(auth, OAuth):
-        return False
-
-    exc_str = str(exception)
-    return "Unexpected authorization response: 500" in exc_str or "OAuth client not found" in exc_str
-
-
-async def _clear_transport_oauth_cache(transport: TransportType) -> None:
-    """Clear cached OAuth state associated with a transport, if available."""
-    auth = getattr(transport, "auth", None)
-    if not isinstance(auth, OAuth) or not hasattr(auth, "token_storage_adapter"):
-        return
-
-    auth._initialized = False
-    await auth.token_storage_adapter.clear()
-
-
-async def _connect_proxy_client(transport: TransportType) -> ProxyClient:
-    """Return a *connected* ProxyClient, retrying once after clearing stale cached OAuth state.
-
-    The caller is responsible for the client's lifecycle (in particular, calling
-    ``__aexit__`` when done).  This is a lower-level building block used by both the
-    initial connection and the reload flow.
-    """
+    logger.info(f"MCP Compressor daemon on http://127.0.0.1:{server_port} (estate at /mcp)")
     try:
-        with suppress_recoverable_oauth_traceback_logging(transport):
-            client = ProxyClient(transport=transport, init_timeout=None)
-            await client.__aenter__()
-            return client
-    except Exception as exc:
-        if not _should_retry_stale_oauth_connect_error(exc, transport):
-            raise
-
-        logger.warning(
-            "OAuth connection failed due to stale cached credentials; clearing cached OAuth state and retrying once"
-        )
-        await _clear_transport_oauth_cache(transport)
-
-    try:
-        client = ProxyClient(transport=transport, init_timeout=None)
-        await client.__aenter__()
-        return client
-    except Exception as exc:
-        raise RuntimeError(
-            f"{exc}\n\nCached OAuth credentials may be stale. "
-            "mcp-compressor cleared cached OAuth state and retried once. "
-            "If the problem persists, run 'mcp-compressor clear-oauth' and try again."
-        ) from exc
-
-
-@asynccontextmanager
-async def _managed_proxy_client(
-    transport: TransportType,
-    lazy: bool = False,
-) -> AsyncGenerator[ReloadableClientManager, None]:
-    """Create and manage a ReloadableClientManager bound to ``transport``.
-
-    The manager is started on entry (unless ``lazy=True``) and stopped on exit.
-    Its ``connect`` closure calls :func:`_connect_proxy_client` to produce a fresh
-    connected client each time start/reload is invoked.
-    """
-
-    async def connect() -> ProxyClient:
-        return await _connect_proxy_client(transport)
-
-    manager = ReloadableClientManager(connect=connect)
-    if not lazy:
-        await manager.start()
-    try:
-        yield manager
+        # Do NOT install our own signal handlers: uvicorn installs its own when
+        # serve() starts, setting should_exit=True so serve() returns cleanly and
+        # the finally below tears down the estate's stdio backends.
+        await uvicorn_server.serve()
     finally:
-        await manager.stop()
-
-
-async def _async_main(
-    command_or_url_list: list[str] | None,
-    cwd: str | None,
-    env_list: list[str] | None,
-    header_list: list[str] | None,
-    timeout: float,
-    compression_level: CompressionLevel,
-    server_name: str | None,
-    log_level: LogLevel,
-    toonify: bool,
-    cli_mode: bool = False,
-    cli_port: int | None = None,
-    include_tools: list[str] | None = None,
-    exclude_tools: list[str] | None = None,
-    lazy: bool = False,
-    server_mode: bool = False,
-    server_port: int = 9020,
-    mcp_config: str | None = None,
-) -> None:
-    """Run the MCP Compressor proxy server asynchronously."""
-    logger.info(f"Starting MCP Compressor with log level: {log_level.value}")
-
-    if server_mode:
-        from .estate import DEFAULT_MCP_CONFIG, load_servers
-        from .estate_server import Estate, build_estate_server
-        from .server import BackendPool, create_daemon_app
-
-        # One estate for the whole daemon, read from the client's own config.
-        # Every session that connects to /mcp shares these backends: the point
-        # of the service is that a backend runs once per user, not once per
-        # session. Backends are still lazy — a spec is a few strings until a
-        # tool is invoked (estate_server.EstateBackend).
-        config_path = mcp_config or DEFAULT_MCP_CONFIG
-        specs = load_servers(config_path)
-        logger.info(f"Estate: {len(specs)} server(s) from {config_path}")
-        estate = Estate(specs, compression_level=compression_level, config_path=config_path)
-        estate_app = build_estate_server(estate).http_app(path="/mcp", transport="streamable-http")
-
-        pool = BackendPool(log_level=log_level.value)
-        app = create_daemon_app(pool, estate_app)
-        config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level=log_level.value)
-        uvicorn_server = uvicorn.Server(config)
-        logger.info(f"MCP Compressor daemon on http://127.0.0.1:{server_port} (estate at /mcp)")
-        try:
-            await uvicorn_server.serve()
-        finally:
-            # Both hold stdio children (estate backends; pool-spawned backends).
-            # Without this they outlive the daemon as orphans. Reachable on
-            # SIGTERM (uvicorn returns from serve()) and on KeyboardInterrupt.
-            logger.info("Shutting down daemon")
-            await pool.close()
-            await estate.close()
-    elif mcp_config:
-        from .estate import load_servers
-        from .estate_server import Estate, build_estate_server
-
-        specs = load_servers(mcp_config)
-        logger.info(f"Estate mode: {len(specs)} server(s) from {mcp_config}")
-        estate = Estate(specs, compression_level=compression_level, config_path=mcp_config)
-        try:
-            await build_estate_server(estate).run_async(show_banner=False)
-        finally:
-            # Backends are stdio children; without this they outlive the front
-            # end as orphans holding whatever the tools were holding.
-            await estate.close()
-    else:
-        # Client mode: connect to pool, spawn backend, proxy tools
-        # When lazy=True, bypass the pool and use standalone mode which supports
-        # lazy loading natively (serves cached tools, defers subprocess start).
-        if lazy:
-            async with _server(
-                command_or_url_list=command_or_url_list,  # type: ignore[arg-type]
-                cwd=cwd,
-                env_list=env_list,
-                header_list=header_list,
-                timeout=timeout,
-                compression_level=compression_level,
-                server_name=server_name,
-                toonify=toonify,
-                cli_mode=cli_mode,
-                cli_port=cli_port,
-                include_tools=include_tools,
-                exclude_tools=exclude_tools,
-                lazy=True,
-            ) as mcp:
-                logger.info("Starting MCP Compressor client (lazy standalone)")
-                await mcp.run_async(show_banner=False, log_level=log_level.value)
-        else:
-            async with _client_mode(
-                port=server_port,
-                command_or_url_list=command_or_url_list,  # type: ignore[arg-type]  # validated non-None in main()
-                env_list=env_list,
-                compression_level=compression_level,
-                server_name=server_name,
-                toonify=toonify,
-            ) as mcp:
-                logger.info("Starting MCP Compressor client")
-                await mcp.run_async(show_banner=False, log_level=log_level.value)
-
-
-@asynccontextmanager
-async def _server(
-    command_or_url_list: list[str],
-    cwd: str | None,
-    env_list: list[str] | None,
-    header_list: list[str] | None,
-    timeout: float,
-    compression_level: CompressionLevel,
-    server_name: str | None,
-    toonify: bool = False,
-    cli_mode: bool = False,
-    cli_port: int | None = None,
-    include_tools: list[str] | None = None,
-    exclude_tools: list[str] | None = None,
-    lazy: bool = False,
-) -> AsyncGenerator[FastMCP, None]:
-    command_or_url = " ".join(command_or_url_list)
-    transport_type = _infer_transport_type(command_or_url)
-    logger.info(f"Inferred transport type: {transport_type}")
-
-    # Handle different transport types
-    transport: TransportType
-    if transport_type == "stdio":
-        transport = _get_stdio_transport(
-            command=command_or_url_list[0], args=command_or_url_list[1:], cwd=cwd, env_list=env_list
-        )
-    elif transport_type == "http":
-        transport = _get_streamable_http_transport(url=command_or_url, header_list=header_list, timeout=timeout)
-    elif transport_type == "sse":
-        transport = _get_sse_transport(url=command_or_url, header_list=header_list, timeout=timeout)
-
-    if cli_mode:
-        cli_name = sanitize_cli_name(server_name or "mcp")
-        async with _cli_mode_server(
-            transport=transport,
-            transport_type=transport_type,
-            cli_name=cli_name,
-            compression_level=compression_level,
-            server_name=server_name,
-            toonify=toonify,
-            cli_port=cli_port,
-            include_tools=include_tools,
-            exclude_tools=exclude_tools,
-        ) as mcp:
-            yield mcp
-        return
-
-    catalog_cache_key = _catalog_cache.make_cache_key(command_or_url, include_tools, exclude_tools, server_name=server_name) if lazy else None
-
-    logger.info("Initializing proxy server")
-    async with _managed_proxy_client(transport, lazy=lazy) as client_manager:
-        mcp = FastMCPProxy(client_factory=client_manager.get_client, name="MCP Compressor Proxy")
-
-        # Shared compressed tools for backend access
-        compressed_tools = CompressedTools(
-            mcp,
-            compression_level=compression_level,
-            server_name=server_name,
-            toonify=toonify,
-            include_tools=include_tools,
-            exclude_tools=exclude_tools,
-            client_manager=client_manager,
-            catalog_cache_key=catalog_cache_key,
-            catalog_source=command_or_url,
-        )
-
-        logger.info("Configuring compressed tools middleware")
-        await compressed_tools.configure_server()
-
-        stats = await compressed_tools.get_compression_stats()
-        print_banner(server_name, transport_type, stats, compression_level)
-
-        yield mcp
-
-
-@asynccontextmanager
-async def _client_mode(
-    port: int,
-    command_or_url_list: list[str],
-    env_list: list[str] | None = None,
-    compression_level: CompressionLevel = CompressionLevel.MEDIUM,
-    server_name: str | None = None,
-    toonify: bool = False,
-) -> AsyncGenerator[FastMCP, None]:
-    """Connect to a shared MCP Compressor server as a thin passthrough client.
-
-    Sends the backend command to the server's ``/spawn`` endpoint, which starts
-    the backend (or returns an existing one), then creates a FastMCPProxy that
-    passes through the server's already-compressed tool catalog.
-    """
-    spawn_result = await _spawn_on_server(port, command_or_url_list, env_list, compression_level, server_name)
-    backend_port = spawn_result["port"]
-    backend_key = spawn_result["backend_key"]
-    tool_count = spawn_result["tool_count"]
-
-    url = f"http://127.0.0.1:{backend_port}/mcp"
-    transport = StreamableHttpTransport(url=url)
-    async with _managed_proxy_client(transport) as client_manager:
-        mcp = FastMCPProxy(
-            client_factory=client_manager.get_client,
-            name="MCP Compressor Client",
-        )
-        logger.info(f"Connected to shared backend {backend_key!r} ({tool_count} tools) at {url}")
-        print(f"MCP Compressor client -> {url} ({tool_count} tools)", file=sys.stderr)
-        yield mcp
-
-
-async def _spawn_on_server(
-    port: int,
-    command_or_url_list: list[str],
-    env_list: list[str] | None = None,
-    compression_level: CompressionLevel = CompressionLevel.MEDIUM,
-    server_name: str | None = None,
-) -> dict[str, Any]:
-    """Ask the pool server to start a backend and return its connection info."""
-    import httpx
-
-    command = command_or_url_list[0]
-    args = command_or_url_list[1:]
-    env: dict[str, str] | None = None
-    if env_list:
-        env = {}
-        for var in env_list:
-            key, val = var.split("=", 1)
-            env[key] = _interpolate_string(val)
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"http://127.0.0.1:{port}/spawn",
-            json={
-                "command": command,
-                "args": args,
-                "env": env,
-                "compression_level": compression_level.value,
-                "server_name": server_name,
-            },
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-@asynccontextmanager
-async def _cli_mode_server(
-    transport: TransportType,
-    transport_type: str,
-    cli_name: str,
-    compression_level: CompressionLevel,
-    server_name: str | None,
-    toonify: bool,
-    cli_port: int | None,
-    include_tools: list[str] | None,
-    exclude_tools: list[str] | None,
-) -> AsyncGenerator[FastMCP, None]:
-    """Set up and run the CLI mode server.
-
-    Architecture is identical to normal mode — ProxyClient + CompressedTools —
-    with cli_mode=True so CompressedTools registers the single help tool instead
-    of the wrapper tools, and the bridge calls invoke_tool directly.
-    """
-    async with _managed_proxy_client(transport) as client_manager:
-        logger.info("Initializing proxy server for CLI mode")
-        mcp = FastMCPProxy(
-            client_factory=client_manager.get_client, name="MCP Compressor Proxy", version="0.1.0"
-        )
-
-        compressed_tools = CompressedTools(
-            mcp,
-            compression_level=compression_level,
-            server_name=server_name,
-            toonify=toonify,
-            cli_mode=True,
-            cli_name=cli_name,
-            include_tools=include_tools,
-            exclude_tools=exclude_tools,
-            client_manager=client_manager,
-        )
-        await compressed_tools.configure_server()
-
-        stats = await compressed_tools.get_compression_stats()
-
-        port = cli_port or _find_free_port()
-        session_pid = os.getppid()
-
-        bridge = CliBridge(
-            cli_name=cli_name,
-            server_description=compressed_tools._server_description,
-            get_tools_fn=compressed_tools.get_backend_tools,
-            invoke_fn=compressed_tools.invoke_tool,
-            port=port,
-            fastmcp=mcp,
-        )
-        bridge_server = bridge.make_server()
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(bridge_server.serve)
-            while not bridge_server.started:
-                await anyio.sleep(0.01)
-
-            script_path, on_path = generate_cli_script(cli_name=cli_name, bridge_port=port, session_pid=session_pid)
-            invoke_prefix = cli_name if on_path else f"./{cli_name}"
-            print_banner(
-                server_name,
-                transport_type,
-                stats,
-                compression_level,
-                cli_mode=True,
-                cli_script_path=str(script_path),
-                cli_bridge_url=f"http://127.0.0.1:{port}",
-                cli_invoke_prefix=invoke_prefix,
-            )
-
-            logger.info("Starting MCP Compressor server in CLI mode")
-            try:
-                yield mcp
-            finally:
-                bridge_server.should_exit = True
-                tg.cancel_scope.cancel()
-                remove_cli_script_entry(cli_name=cli_name, session_pid=session_pid)
-                logger.debug("Removed CLI script entry for session_pid={}", session_pid)
-
-
-_OAUTH_CONFIG_DIR = Path.home() / ".config" / "mcp-compressor"
-_OAUTH_TOKEN_DIR = _OAUTH_CONFIG_DIR / "oauth-tokens"
-_OAUTH_KEY_FILE = _OAUTH_CONFIG_DIR / ".key"
-_KEYRING_SERVICE = "mcp-compressor"
-_KEYRING_USERNAME = "oauth-encryption-key"
-
-
-def _get_or_create_encryption_key() -> bytes:
-    """Return a persistent Fernet encryption key for OAuth token storage.
-
-    Tries the OS keychain first (macOS Keychain, Windows Credential Manager,
-    GNOME Keyring).  Falls back to a file at
-    ``~/.config/mcp-compressor/.key`` with 0o600 permissions if the keychain
-    is unavailable (e.g. headless/server environments).
-    """
-    # 1. Try OS keychain
-    try:
-        stored = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
-        if stored:
-            logger.debug("OAuth encryption key loaded from OS keychain")
-            return stored.encode()
-        # Generate and store a new key
-        new_key = Fernet.generate_key()
-        keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, new_key.decode())
-        logger.debug("OAuth encryption key generated and stored in OS keychain")
-    except keyring.errors.NoKeyringError:
-        logger.debug("No OS keychain available; falling back to file-based encryption key")
-    else:
-        return new_key
-
-    # 2. File-based fallback
-    _OAUTH_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if _OAUTH_KEY_FILE.exists():
-        key = _OAUTH_KEY_FILE.read_bytes().strip()
-        logger.debug("OAuth encryption key loaded from {}", _OAUTH_KEY_FILE)
-        return key
-    new_key = Fernet.generate_key()
-    _OAUTH_KEY_FILE.write_bytes(new_key)
-    _OAUTH_KEY_FILE.chmod(0o600)
-    logger.debug("OAuth encryption key generated and stored at {}", _OAUTH_KEY_FILE)
-    return new_key
-
-
-def _build_token_storage() -> AsyncKeyValue:
-    """Build an encrypted persistent OAuth token storage backend.
-
-    Tokens are stored in ``~/.config/mcp-compressor/oauth-tokens`` using a FileTreeStore with stable sanitization
-    strategies, then encrypted with a Fernet key obtained from :func:`_get_or_create_encryption_key`.
-    """
-    _OAUTH_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    store: AsyncKeyValue = FileTreeStore(
-        data_directory=_OAUTH_TOKEN_DIR,
-        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(_OAUTH_TOKEN_DIR),
-        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(_OAUTH_TOKEN_DIR),
-    )
-    fernet_key = _get_or_create_encryption_key()
-    encrypted_store = FernetEncryptionWrapper(key_value=store, fernet=Fernet(fernet_key))
-    logger.debug("OAuth token storage: encrypted file-tree store at {}", _OAUTH_TOKEN_DIR)
-    return encrypted_store
-
-
-def _find_free_port() -> int:
-    """Find a free port on the loopback interface."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _parse_tool_name_list(tool_name_group: str | None) -> list[str] | None:
-    """Parse a comma-separated tool name list into a normalized list."""
-    if not tool_name_group:
-        return None
-
-    tool_names = [tool_name.strip() for tool_name in tool_name_group.split(",")]
-    return [tool_name for tool_name in tool_names if tool_name] or None
-
-
-def _interpolate_string(value: str) -> str:
-    """Interpolate environment variables in a single string.
-
-    Args:
-        value: A string that may contain environment variable references like ${VAR_NAME}.
-
-    Returns:
-        The string with interpolated environment variables. If a variable cannot be interpolated, it is left as-is
-            without interpolation.
-    """
-    try:
-        if not value or "${" not in value:
-            return value
-        # Replace ${VAR_NAME} with {VAR_NAME} and use format() with environment variables
-        return value.replace("${", "{").format(**os.environ)
-    except Exception as e:
-        logger.warning(f"Failed to interpolate environment variable {value}: {e}, using uninterpolated value")
-        return value
-
-
-def _infer_transport_type(command_or_url: str) -> Literal["stdio", "http", "sse"]:
-    """Infer a transport type from a command or URL string."""
-    if not command_or_url.startswith(("http://", "https://")):
-        return "stdio"
-    return "sse" if re.search(r"/sse(/|\?|&|$)", command_or_url) else "http"
-
-
-@overload
-def _get_remote_transport(
-    url: str, header_list: list[str] | None, timeout: float, transport_type: Literal["http"]
-) -> StreamableHttpTransport: ...
-
-
-@overload
-def _get_remote_transport(
-    url: str, header_list: list[str] | None, timeout: float, transport_type: Literal["sse"]
-) -> SSETransport: ...
-
-
-def _get_remote_transport(
-    url: str, header_list: list[str] | None, timeout: float, transport_type: Literal["http", "sse"]
-) -> StreamableHttpTransport | SSETransport:
-    """Create a remote transport (HTTP or SSE) with the specified configuration.
-
-    Args:
-        url: The URL of the remote MCP server.
-        header_list: Optional list of headers in Header-Name=Value format.
-        timeout: Timeout for SSE read operations.
-        transport_type: Either "http" for streamable HTTP or "sse" for server-sent events.
-
-    Returns:
-        Configured transport instance for the specified type.
-    """
-    header_dict: dict[str, str] = {}
-    if header_list:
-        for header in header_list:
-            key, val = header.split("=", 1)
-            header_dict[key] = _interpolate_string(val)
-
-    oauth = OAuth(mcp_url=url, token_storage=_build_token_storage())
-
-    if transport_type == "http":
-        return StreamableHttpTransport(url=url, headers=header_dict, auth=oauth)
-    return SSETransport(url=url, headers=header_dict, auth=oauth, sse_read_timeout=timeout)
-
-
-def _get_streamable_http_transport(url: str, header_list: list[str] | None, timeout: float) -> StreamableHttpTransport:
-    """Create a streamable HTTP transport for connecting to an MCP server.
-
-    Args:
-        url: The HTTP URL of the MCP server.
-        header_list: Optional list of headers in Header-Name=Value format.
-        timeout: Timeout for read operations.
-
-    Returns:
-        Configured StreamableHttpTransport instance.
-    """
-    return _get_remote_transport(url, header_list, timeout, transport_type="http")
-
-
-def _get_sse_transport(url: str, header_list: list[str] | None, timeout: float) -> SSETransport:
-    """Create an SSE (Server-Sent Events) transport for connecting to an MCP server.
-
-    Args:
-        url: The SSE URL of the MCP server.
-        header_list: Optional list of headers in Header-Name=Value format.
-        timeout: Timeout for SSE read operations.
-
-    Returns:
-        Configured SSETransport instance.
-    """
-    return _get_remote_transport(url, header_list, timeout, transport_type="sse")
-
-
-def _get_stdio_transport(command: str, args: list[str], cwd: str | None, env_list: list[str] | None) -> StdioTransport:
-    """Create a stdio transport for running a local MCP server as a subprocess.
-
-    Args:
-        command: The command to execute (e.g., "uvx", "python").
-        args: Arguments to pass to the command.
-        cwd: Optional working directory for the subprocess.
-        env_list: Optional list of environment variables in VAR=VALUE format.
-
-    Returns:
-        Configured StdioTransport instance.
-    """
-    # Start with the entire environment from the current process - this is appropriate because mcp-compressor is already
-    # a stdio MCP proxy itself, so clients have applied any necessary environment filtering already
-    env = os.environ.copy()
-    # Update with any explicitly provided environment variables
-    if env_list:
-        for var in env_list:
-            key, val = var.split("=", 1)
-            env[key] = _interpolate_string(val)
-    return StdioTransport(command=command, args=args, env=env, cwd=cwd)
+        logger.info("Shutting down daemon")
+        await estate.close()
 
 
 def entrypoint() -> None:
-    """Main entrypoint for the mcp-compressor CLI.
-
-    Handles the 'clear-oauth' and 'catalog' subcommands manually before
-    delegating to the main Typer app, so that 'mcp-compressor <url>' works
-    without a subcommand.
-    """
-    if len(sys.argv) > 1 and sys.argv[1] == "clear-oauth":
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        clear_oauth_app()
-    elif len(sys.argv) > 1 and sys.argv[1] == "catalog":
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        catalog_app()
-    else:
-        app()
+    """Console-script entry point."""
+    app()
 
 
 if __name__ == "__main__":

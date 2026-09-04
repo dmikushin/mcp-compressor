@@ -6,7 +6,6 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 
-from mcp_compressor.main import _server
 from mcp_compressor.tools import QUIET_MODE_THRESHOLD
 from mcp_compressor.types import CompressionLevel
 
@@ -276,20 +275,43 @@ async def test_toonify_does_not_modify_invoke_tool_error_response(proxy_mcp_clie
 
 async def test_include_and_exclude_tools_filters_exposed_backend_tools() -> None:
     """Test that include/exclude filters limit which backend tools are exposed."""
+    from contextlib import asynccontextmanager
+
+    from fastmcp.client.transports import StdioTransport
+    from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
+
+    from mcp_compressor.tools import CompressedTools, ReloadableClientManager
+
     server_path = Path(__file__).parent / "mcp_server.py"
 
+    @asynccontextmanager
+    async def proxy():
+        transport = StdioTransport(command="python", args=[str(server_path)])
+
+        async def connect() -> ProxyClient:
+            c = ProxyClient(transport=transport, init_timeout=None)
+            await c.__aenter__()
+            return c
+
+        manager = ReloadableClientManager(connect=connect)
+        await manager.start()
+        try:
+            mcp_ = FastMCPProxy(client_factory=manager.get_client, name="MCP Compressor Proxy")
+            compressed = CompressedTools(
+                mcp_,
+                compression_level=CompressionLevel.LOW,
+                server_name="test_server",
+                include_tools=["add", "do_nothing"],
+                exclude_tools=["do_nothing"],
+                client_manager=manager,
+            )
+            await compressed.configure_server()
+            yield mcp_
+        finally:
+            await manager.stop()
+
     async with (
-        _server(
-            command_or_url_list=["python", str(server_path)],
-            cwd=None,
-            env_list=None,
-            header_list=None,
-            timeout=10.0,
-            compression_level=CompressionLevel.LOW,
-            server_name="test_server",
-            include_tools=["add", "do_nothing"],
-            exclude_tools=["do_nothing"],
-        ) as mcp,
+        proxy() as mcp,
         Client(mcp) as client,
     ):
         schema = await client.call_tool("test_server_get_tool_schema", {"tool_name": "add"})
