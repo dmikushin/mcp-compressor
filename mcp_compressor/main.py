@@ -520,7 +520,37 @@ async def _async_main(
     """Run the MCP Compressor proxy server asynchronously."""
     logger.info(f"Starting MCP Compressor with log level: {log_level.value}")
 
-    if mcp_config:
+    if server_mode:
+        from .estate import DEFAULT_MCP_CONFIG, load_servers
+        from .estate_server import Estate, build_estate_server
+        from .server import BackendPool, create_daemon_app
+
+        # One estate for the whole daemon, read from the client's own config.
+        # Every session that connects to /mcp shares these backends: the point
+        # of the service is that a backend runs once per user, not once per
+        # session. Backends are still lazy — a spec is a few strings until a
+        # tool is invoked (estate_server.EstateBackend).
+        config_path = mcp_config or DEFAULT_MCP_CONFIG
+        specs = load_servers(config_path)
+        logger.info(f"Estate: {len(specs)} server(s) from {config_path}")
+        estate = Estate(specs, compression_level=compression_level, config_path=config_path)
+        estate_app = build_estate_server(estate).http_app(path="/mcp", transport="streamable-http")
+
+        pool = BackendPool(log_level=log_level.value)
+        app = create_daemon_app(pool, estate_app)
+        config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level=log_level.value)
+        uvicorn_server = uvicorn.Server(config)
+        logger.info(f"MCP Compressor daemon on http://127.0.0.1:{server_port} (estate at /mcp)")
+        try:
+            await uvicorn_server.serve()
+        finally:
+            # Both hold stdio children (estate backends; pool-spawned backends).
+            # Without this they outlive the daemon as orphans. Reachable on
+            # SIGTERM (uvicorn returns from serve()) and on KeyboardInterrupt.
+            logger.info("Shutting down daemon")
+            await pool.close()
+            await estate.close()
+    elif mcp_config:
         from .estate import load_servers
         from .estate_server import Estate, build_estate_server
 
@@ -533,22 +563,6 @@ async def _async_main(
             # Backends are stdio children; without this they outlive the front
             # end as orphans holding whatever the tools were holding.
             await estate.close()
-    elif server_mode:
-        from .server import BackendPool, create_pool_app
-
-        pool = BackendPool(log_level=log_level.value)
-        app = create_pool_app(pool)
-        config = uvicorn.Config(app, host="127.0.0.1", port=server_port, log_level=log_level.value)
-        uvicorn_server = uvicorn.Server(config)
-        logger.info(f"MCP Compressor backend pool on http://127.0.0.1:{server_port}")
-        try:
-            await uvicorn_server.serve()
-        finally:
-            # Tear down all spawned backends so stdio child processes don't
-            # outlive the daemon. Reachable on SIGTERM (uvicorn handles signal
-            # and returns from serve()) and on KeyboardInterrupt.
-            logger.info("Shutting down backend pool")
-            await pool.close()
     else:
         # Client mode: connect to pool, spawn backend, proxy tools
         # When lazy=True, bypass the pool and use standalone mode which supports

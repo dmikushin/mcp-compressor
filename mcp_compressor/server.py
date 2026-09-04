@@ -239,8 +239,8 @@ class BackendPool:
             await self._teardown(instance)
 
 
-def create_pool_app(pool: BackendPool) -> Starlette:
-    """Build the Starlette app that fronts the backend pool."""
+def _pool_routes(pool: BackendPool) -> list[Route]:
+    """The daemon's control-plane routes over a backend pool."""
 
     async def spawn(request: Request) -> JSONResponse:
         body = await request.json()
@@ -271,9 +271,25 @@ def create_pool_app(pool: BackendPool) -> Starlette:
     async def health(request: Request) -> Response:
         return Response("ok", media_type="text/plain")
 
-    return Starlette(
-        routes=[
-            Route("/health", health, methods=["GET"]),
-            Route("/spawn", spawn, methods=["POST"]),
-        ]
-    )
+    return [
+        Route("/health", health, methods=["GET"]),
+        Route("/spawn", spawn, methods=["POST"]),
+    ]
+
+
+def create_pool_app(pool: BackendPool) -> Starlette:
+    """Build the Starlette app that fronts the backend pool."""
+    return Starlette(routes=_pool_routes(pool))
+
+
+def create_daemon_app(pool: BackendPool, estate_app: Starlette) -> Starlette:
+    """The daemon's full surface: the estate at /mcp, plus /health and /spawn.
+
+    ``estate_app`` is a FastMCP streamable-HTTP app — it already carries the
+    /mcp route and, crucially, the lifespan that runs the MCP session manager's
+    task group. The control-plane routes are appended to it rather than the
+    estate being mounted into a fresh Starlette, so that lifespan stays the
+    app's own and is not silently dropped.
+    """
+    estate_app.router.routes.extend(_pool_routes(pool))
+    return estate_app
